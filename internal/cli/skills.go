@@ -1,0 +1,160 @@
+package cli
+
+import (
+	"fmt"
+	"io"
+	"strings"
+
+	"github.com/aistatine/sonut/internal/redaction"
+	"github.com/aistatine/sonut/internal/skills"
+)
+
+type skillListOptions struct {
+	json bool
+}
+
+func runSkills(args []string, stdout io.Writer, stderr io.Writer, deps appDeps) int {
+	command := "list"
+	rest := args
+	if len(args) > 0 {
+		switch args[0] {
+		case "-h", "--help", "help":
+			if err := writeSkillsHelp(stdout); err != nil {
+				return exitCrash
+			}
+			return exitSuccess
+		case "list", "add", "info", "remove", "rm":
+			command, rest = args[0], args[1:]
+		default:
+			// Treat a leading flag (e.g. --json) as belonging to the implicit
+			// `list` command so `at skills --json` works like `at plugins`.
+			if !strings.HasPrefix(args[0], "-") {
+				return writeExecUsageError(stderr, fmt.Sprintf("unknown skills subcommand %q", args[0]))
+			}
+		}
+	}
+
+	switch command {
+	case "list":
+		options, help, err := parseSkillListArgs(rest)
+		if err != nil {
+			return writeExecUsageError(stderr, err.Error())
+		}
+		if help {
+			if err := writeSkillsListHelp(stdout); err != nil {
+				return exitCrash
+			}
+			return exitSuccess
+		}
+		return runSkillsList(deps.skillsDir(), options, stdout, stderr)
+	case "add":
+		return runSkillAdd(rest, deps.skillsDir(), stdout, stderr)
+	case "info":
+		return runSkillInfo(rest, deps.skillsDir(), stdout, stderr)
+	case "remove", "rm":
+		return runSkillRemove(rest, deps.skillsDir(), stdout, stderr)
+	default:
+		return writeExecUsageError(stderr, fmt.Sprintf("unknown skills subcommand %q", command))
+	}
+}
+
+func runSkillsList(dir string, options skillListOptions, stdout io.Writer, stderr io.Writer) int {
+	discovered, err := skills.List(dir)
+	if err == nil {
+		// Show compiled-in bundled skills too (Content already stripped by List;
+		// strip the bundled bodies to match).
+		merged := skills.MergeBundled(discovered)
+		for i := range merged {
+			merged[i].Content = ""
+		}
+		discovered = merged
+	}
+	if err != nil {
+		return writeAppError(stderr, redaction.ErrorMessage(err, redaction.Options{}), exitCrash)
+	}
+	// Surface name collisions that List silently resolved (first directory wins),
+	// so a shadowed same-named skill is reported instead of just disappearing.
+	// Warnings go to stderr, keeping stdout (including --json) clean.
+	if dups, derr := skills.Duplicates(dir); derr == nil {
+		for _, dup := range dups {
+			fmt.Fprintf(stderr, "warning: duplicate skill %q: using %s, ignoring %s\n",
+				redaction.RedactString(dup.Name, redaction.Options{}),
+				redaction.RedactString(dup.Winner, redaction.Options{}),
+				redaction.RedactString(dup.Loser, redaction.Options{}))
+		}
+	} else {
+		// Don't silently swallow a scan failure: "no warnings" would then be
+		// ambiguous (no duplicates vs. detection broke). Surface it on stderr.
+		fmt.Fprintf(stderr, "warning: could not check for duplicate skills: %s\n",
+			redaction.ErrorMessage(derr, redaction.Options{}))
+	}
+	if options.json {
+		payload := struct {
+			Skills []skills.Skill `json:"skills"`
+		}{Skills: discovered}
+		if err := writePrettyJSON(stdout, redaction.RedactValue(payload, redaction.Options{})); err != nil {
+			return exitCrash
+		}
+		return exitSuccess
+	}
+	output := redaction.RedactString(formatSkillList(discovered, dir), redaction.Options{})
+	if _, err := fmt.Fprintln(stdout, output); err != nil {
+		return exitCrash
+	}
+	return exitSuccess
+}
+
+func formatSkillList(discovered []skills.Skill, dir string) string {
+	if len(discovered) == 0 {
+		return fmt.Sprintf("No @code skills found in %s.", dir)
+	}
+	lines := []string{"@code Skills:"}
+	for _, skill := range discovered {
+		line := "  " + skill.Name
+		if skill.Description != "" {
+			line += " - " + skill.Description
+		}
+		lines = append(lines, line)
+		lines = append(lines, "    "+skill.Path)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func parseSkillListArgs(args []string) (skillListOptions, bool, error) {
+	options := skillListOptions{}
+	for _, arg := range args {
+		switch arg {
+		case "-h", "--help", "help":
+			return options, true, nil
+		case "--json":
+			options.json = true
+		default:
+			return options, false, execUsageError{fmt.Sprintf("unknown skills list flag %q", arg)}
+		}
+	}
+	return options, false, nil
+}
+
+func writeSkillsHelp(w io.Writer) error {
+	_, err := fmt.Fprint(w, `Usage:
+  at skills <command>
+
+Commands:
+  list                 List discovered @code skills
+  add <git-url|path>   Install a skill (checksum-pinned in skills.lock)
+  info <name>          Show a skill's frontmatter, source, and pinned hash
+  remove <name>        Remove an installed skill and its lockfile entry
+`)
+	return err
+}
+
+func writeSkillsListHelp(w io.Writer) error {
+	_, err := fmt.Fprint(w, `Usage:
+  at skills list [flags]
+
+Flags:
+      --json    Print discovered skills as JSON
+  -h, --help    Show this help
+`)
+	return err
+}

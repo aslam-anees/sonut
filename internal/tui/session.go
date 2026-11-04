@@ -1,0 +1,907 @@
+package tui
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/aistatine/sonut/internal/agent"
+	"github.com/aistatine/sonut/internal/sandbox"
+	"github.com/aistatine/sonut/internal/sessions"
+	"github.com/aistatine/sonut/internal/sonutruntime"
+	"github.com/aistatine/sonut/internal/tools"
+)
+
+const tuiSessionTitleLimit = 80
+
+type pendingSessionEvent struct {
+	Type    sessions.EventType
+	Payload any
+}
+
+func (m model) ensureActiveSession(prompt string) (model, error) {
+	if m.activeSession.SessionID != "" {
+		return m, nil
+	}
+
+	session, err := m.sessionStore.Create(sessions.CreateInput{
+		Title:    tuiSessionTitle(prompt),
+		Cwd:      m.cwd,
+		ModelID:  m.modelName,
+		Provider: m.providerName,
+	})
+	if err != nil {
+		return m, err
+	}
+	m.activeSession = session
+	m.sessionEvents = []sessions.Event{}
+	return m, nil
+}
+
+func (m model) appendSessionEvent(eventType sessions.EventType, payload any) (model, error) {
+	if m.activeSession.SessionID == "" {
+		return m, nil
+	}
+
+	event, err := m.sessionStore.AppendEvent(m.activeSession.SessionID, sessions.AppendEventInput{
+		Type:    eventType,
+		Payload: payload,
+	})
+	if err != nil {
+		return m, err
+	}
+	m.activeSession.UpdatedAt = event.CreatedAt
+	m.activeSession.EventCount = event.Sequence
+	m.activeSession.LastEventType = event.Type
+	m.sessionEvents = append(m.sessionEvents, event)
+	return m, nil
+}
+
+func (m model) appendSessionEvents(events []pendingSessionEvent) (model, []transcriptRow) {
+	rows := []transcriptRow{}
+	for _, event := range events {
+		next, err := m.appendSessionEvent(event.Type, event.Payload)
+		if err != nil {
+			rows = append(rows, transcriptRow{kind: rowError, text: "session record error: " + err.Error()})
+			continue
+		}
+		m = next
+	}
+	return m, rows
+}
+
+// appendSessionEventsEphemeral persists events to the session store (so /resume
+// replays them) and refreshes the active session's metadata, but does NOT add
+// them to m.sessionEvents — the model-facing context wrapped into later prompts.
+// Used for /btw asides so a side question never steers the main conversation.
+func (m model) appendSessionEventsEphemeral(events []pendingSessionEvent) (model, []transcriptRow) {
+	rows := []transcriptRow{}
+	if m.activeSession.SessionID == "" || m.sessionStore == nil {
+		return m, rows
+	}
+	for _, e := range events {
+		event, err := m.sessionStore.AppendEvent(m.activeSession.SessionID, sessions.AppendEventInput{
+			Type:    e.Type,
+			Payload: e.Payload,
+		})
+		if err != nil {
+			rows = append(rows, transcriptRow{kind: rowError, text: "session record error: " + err.Error()})
+			continue
+		}
+		m.activeSession.UpdatedAt = event.CreatedAt
+		m.activeSession.EventCount = event.Sequence
+		m.activeSession.LastEventType = event.Type
+	}
+	return m, rows
+}
+
+// appendSessionEventsTo persists events into a specific (non-active) session —
+// the late flush of a run cancelled before a /resume switched sessions. The
+// active session's in-memory metadata is deliberately untouched.
+func (m model) appendSessionEventsTo(sessionID string, events []pendingSessionEvent) []transcriptRow {
+	rows := []transcriptRow{}
+	if m.sessionStore == nil || sessionID == "" {
+		return rows
+	}
+	for _, event := range events {
+		if _, err := m.sessionStore.AppendEvent(sessionID, sessions.AppendEventInput{
+			Type:    event.Type,
+			Payload: event.Payload,
+		}); err != nil {
+			rows = append(rows, transcriptRow{kind: rowError, text: "session record error: " + err.Error()})
+		}
+	}
+	return rows
+}
+
+// flushableSessionEvents selects the events worth persisting from a run that was
+// cancelled mid-flight. The cancel path already records a single "Run cancelled."
+// error, so the goroutine's trailing EventError (the ctx-cancellation error) is
+// dropped to avoid a duplicate; everything else it accumulated before the cancel
+// — tool calls/results, permission events, usage, and the EventSessionCheckpoint
+// blobs that /rewind depends on — is kept.
+func flushableSessionEvents(events []pendingSessionEvent) []pendingSessionEvent {
+	flushable := make([]pendingSessionEvent, 0, len(events))
+	for _, event := range events {
+		if event.Type == sessions.EventError {
+			continue
+		}
+		flushable = append(flushable, event)
+	}
+	return flushable
+}
+
+// lastUpdatePlanItems replays a session's events to find the most recent
+// update_plan tool call and reconstructs its plan items, so /resume can
+// re-sync the sticky plan panel — without this, the panel comes back empty
+// on resume even though the plan is still visible in the replayed transcript,
+// since the panel is normally fed live from the in-memory update_plan tool
+// instance, which does not survive a resume.
+func lastUpdatePlanItems(events []sessions.Event) []tools.PlanItem {
+	var latest []tools.PlanItem
+	for _, event := range events {
+		if event.Type != sessions.EventToolCall {
+			continue
+		}
+		var call struct {
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+		}
+		if err := json.Unmarshal(event.Payload, &call); err != nil || call.Name != "update_plan" {
+			continue
+		}
+		var args struct {
+			Plan []struct {
+				Content  string `json:"content"`
+				Status   string `json:"status"`
+				Notes    string `json:"notes"`
+				Criteria string `json:"criteria"`
+			} `json:"plan"`
+		}
+		if err := json.Unmarshal([]byte(call.Arguments), &args); err != nil {
+			continue
+		}
+		items := make([]tools.PlanItem, 0, len(args.Plan))
+		for _, item := range args.Plan {
+			items = append(items, tools.PlanItem{
+				Content:  item.Content,
+				Status:   item.Status,
+				Notes:    item.Notes,
+				Criteria: item.Criteria,
+			})
+		}
+		latest = items
+	}
+	return latest
+}
+
+func tuiSessionTitle(prompt string) string {
+	// cutRunes keeps the cut on a rune boundary — a bare byte slice could split
+	// a multi-byte rune and persist invalid UTF-8 into the session metadata.
+	title := cutRunes(strings.Join(strings.Fields(prompt), " "), tuiSessionTitleLimit)
+	if title == "" {
+		return "@code TUI session"
+	}
+	return title
+}
+
+func (m model) handleResumeCommand(args string) (model, string) {
+	args = strings.TrimSpace(args)
+	if args == "" {
+		return m, m.resumeText()
+	}
+
+	session, err := m.resolveResumeSession(args)
+	if err != nil {
+		return m, "Sessions\n" + err.Error()
+	}
+	events, err := m.resumeEvents(session.SessionID)
+	if err != nil {
+		return m, "Sessions\nerror: " + err.Error()
+	}
+
+	m.activeSession = *session
+	m.sessionEvents = append([]sessions.Event{}, events...)
+	// Land at the bottom of the rebuilt transcript so the latest turns are
+	// visible immediately (offset 0 = follow tail).
+	m.chatScrollOffset = 0
+	if m.providerName == "" {
+		m.providerName = session.Provider
+	}
+	if m.modelName == "" {
+		m.modelName = session.ModelID
+	}
+	if strings.TrimSpace(session.Cwd) != "" {
+		// Session metadata may come from an older run that stored a relative cwd
+		// or a cwd already concatenated with the active directory. Resolve it once
+		// at the session boundary, then propagate the canonical value everywhere
+		// (/cd, tools, sandbox, and process cwd) before the next turn starts.
+		resumedCwd := tools.ResolveWorkspaceCwd(m.cwd, session.Cwd)
+		if info, statErr := os.Stat(resumedCwd); statErr == nil && info.IsDir() {
+			if engine := m.agentOptions.Sandbox; engine != nil && engine.Scope() != nil {
+				// An existing resumed directory can be added to the active scope;
+				// legacy sessions may point at a path that no longer exists, in
+				// which case the normal tool boundary will report it when used.
+				_, _ = engine.Scope().Add(resumedCwd)
+			}
+			_ = os.Chdir(resumedCwd)
+		}
+		m.cwd = resumedCwd
+		m.agentOptions.Cwd = resumedCwd
+		tools.SetSessionWorkingDir(resumedCwd)
+	}
+	m.plan.updateFromItems(lastUpdatePlanItems(events), m.now())
+	m.resetFiles = resetFilesFromSessionEvents(events)
+
+	rows := initialTranscript()
+	rows = appendRow(rows, rowSystem, m.formatResumeSummary(*session, len(events)))
+	rows = appendTranscriptRowsDedup(rows, transcriptRowsFromSessionEvents(events))
+	m.transcript = rows
+	// Every rehydrated row is settled by construction, so resetting the flush
+	// frontier sends the whole resumed history to native scrollback in one
+	// batch — scrollable, selectable, and O(1) for every later frame.
+	m.resetFlushFrontier("· resumed ·")
+	return m, ""
+}
+
+func (m model) sessionPrompt(prompt string) string {
+	if m.activeSession.SessionID == "" || len(m.sessionEvents) == 0 {
+		return prompt
+	}
+	return sessions.FormatExecPrompt(prompt, sessions.PreparedExec{
+		Mode:          sessions.ModeResume,
+		Session:       m.activeSession,
+		ContextEvents: append([]sessions.Event{}, m.sessionEvents...),
+	})
+}
+
+// sessionConversationHistory converts persisted role-bearing events into the
+// provider's native message shape. Keeping this separate from sessionPrompt is
+// important: sessionPrompt is retained for CLI-compatible text resumes, while
+// the TUI can now send real user/assistant turns and keep fast follow-ups
+// contextual without re-sending a large prose wrapper.
+func sessionConversationHistory(events []sessions.Event) []sonutruntime.Message {
+	turns := sessions.ConversationHistory(events)
+	if len(turns) == 0 {
+		return nil
+	}
+	history := make([]sonutruntime.Message, 0, len(turns))
+	for _, turn := range turns {
+		role := sonutruntime.MessageRole(turn.Role)
+		if role != sonutruntime.MessageRoleUser && role != sonutruntime.MessageRoleAssistant {
+			continue
+		}
+		history = append(history, sonutruntime.Message{Role: role, Content: turn.Content})
+	}
+	return history
+}
+
+func (m model) resolveResumeSession(args string) (*sessions.Metadata, error) {
+	args = strings.TrimSpace(args)
+	if args == "" {
+		return nil, errors.New("no sessions available to resume")
+	}
+	if m.sessionStore == nil {
+		return nil, errors.New("session store unavailable")
+	}
+	if strings.EqualFold(args, "latest") {
+		// Latest *resumable* conversation, so "latest" never lands on a child or
+		// spec sub-run. An explicit `/resume <id>` below still resolves any session.
+		latest, err := m.sessionStore.LatestResumable()
+		if err != nil {
+			return nil, err
+		}
+		if latest == nil {
+			return nil, errors.New("no sessions available to resume")
+		}
+		return latest, nil
+	}
+
+	// Try a direct session-ID lookup first (fast path).
+	if sessions.ValidSessionID(args) {
+		session, err := m.sessionStore.Get(args)
+		if err != nil {
+			return nil, err
+		}
+		if session != nil {
+			return session, nil
+		}
+	}
+
+	// Fallback: search by session title (exact, case-insensitive), then by a
+	// unique session-id prefix. Title search covers `at --resume "My Title"`
+	// and unquoted multi-word titles joined by the CLI flag parser; prefix
+	// search covers a truncated id from the resume hint.
+	all, err := m.sessionStore.ListResumable()
+	if err != nil {
+		return nil, err
+	}
+	var titleMatches []sessions.Metadata
+	var prefixMatches []sessions.Metadata
+	for _, meta := range all {
+		if strings.EqualFold(meta.Title, args) {
+			titleMatches = append(titleMatches, meta)
+		}
+		if strings.HasPrefix(meta.SessionID, args) {
+			prefixMatches = append(prefixMatches, meta)
+		}
+	}
+	if len(titleMatches) == 1 {
+		cp := titleMatches[0]
+		return &cp, nil
+	}
+	if len(titleMatches) > 1 {
+		// Prefer the most recently updated title match (ListResumable is newest-first).
+		cp := titleMatches[0]
+		return &cp, nil
+	}
+	if len(prefixMatches) == 1 {
+		cp := prefixMatches[0]
+		return &cp, nil
+	}
+	if len(prefixMatches) > 1 {
+		return nil, fmt.Errorf("ambiguous session id prefix %q (%d matches); use a longer prefix or the full id", args, len(prefixMatches))
+	}
+
+	return nil, fmt.Errorf("session not found: %s", args)
+}
+
+// resumeEvents reads a session's events for resume, preferring the rehydrated
+// (compaction-aware) view so a resumed session honors a prior /compact — matching
+// the CLI's `at exec --resume` (readExecContextEvents) and the in-TUI /compact
+// reload. Falls back to the raw log if rehydration fails.
+func (m model) resumeEvents(sessionID string) ([]sessions.Event, error) {
+	events, err := m.sessionStore.ReadRehydratedEvents(sessionID)
+	if err == nil {
+		return events, nil
+	}
+	raw, rawErr := m.sessionStore.ReadEvents(sessionID)
+	if rawErr != nil {
+		// Surface the raw-read failure (the actual fallback error), not the earlier
+		// rehydration error, so the caller sees why the fallback itself failed.
+		return nil, rawErr
+	}
+	return raw, nil
+}
+
+// formatResumeSummary reports what the resumed conversation will actually continue
+// with (the active model/provider), noting the session's recorded model/provider
+// when it differs — resume keeps the current model rather than switching.
+func (m model) formatResumeSummary(session sessions.Metadata, eventCount int) string {
+	modelLine := "model: " + displayValue(m.modelName, "atcode")
+	if recorded := strings.TrimSpace(session.ModelID); recorded != "" && !strings.EqualFold(recorded, m.modelName) {
+		modelLine += "  (recorded: " + recorded + ")"
+	}
+	providerLine := "provider: " + displayValue(m.providerName, "none")
+	if recorded := strings.TrimSpace(session.Provider); recorded != "" && !strings.EqualFold(recorded, m.providerName) {
+		providerLine += "  (recorded: " + recorded + ")"
+	}
+	return renderCommandOutput(commandOutput{
+		Title:  "Resumed @code session",
+		Status: commandStatusOK,
+		Sections: []commandSection{{
+			Title: "Session",
+			Lines: []string{
+				"id: " + session.SessionID,
+				"title: " + displayValue(session.Title, "untitled"),
+				modelLine,
+				providerLine,
+				fmt.Sprintf("events: %d", eventCount),
+			},
+		}},
+	})
+}
+
+// sessionWhen formats a session's RFC3339 timestamp for the picker: a precise
+// clock time (with seconds) for today so same-minute sessions stay distinct, the
+// month/day and time earlier this year, else the date. Empty on a parse error.
+func sessionWhen(timestamp string, now time.Time) string {
+	parsed, err := time.Parse(time.RFC3339, strings.TrimSpace(timestamp))
+	if err != nil {
+		return ""
+	}
+	parsed, now = parsed.Local(), now.Local()
+	switch {
+	case parsed.Year() == now.Year() && parsed.YearDay() == now.YearDay():
+		return parsed.Format("15:04:05")
+	case parsed.Year() == now.Year():
+		return parsed.Format("Jan _2 15:04")
+	default:
+		return parsed.Format("2006-01-02")
+	}
+}
+
+// newSessionPicker builds the interactive /resume picker (mirrors /model & /provider):
+// one row per resumable session — title (Label) + id and relative age (Meta). Returns
+// nil when there are no resumable sessions so the caller falls back to the text path.
+func (m model) newSessionPicker() *commandPicker {
+	if m.sessionStore == nil {
+		return nil
+	}
+	metas, err := m.sessionStore.ListResumable()
+	if err != nil || len(metas) == 0 {
+		return nil
+	}
+	now := m.now()
+	items := make([]pickerItem, 0, len(metas))
+	for _, meta := range metas {
+		// Skip empty/failed runs (no assistant output, no tool calls) — e.g. the
+		// same prompt retried while the model wasn't responding. They have nothing
+		// to resume and otherwise flood the list with identical rows. Still on disk.
+		if !m.sessionHasResumableContent(meta.SessionID) {
+			continue
+		}
+		// Lead with the timestamp so same-titled sessions (e.g. the same first
+		// prompt run several times) are visually distinct; the id (right, faint)
+		// stays for reference and is what selection actually resolves.
+		label := displayValue(meta.Title, "untitled")
+		if when := sessionWhen(meta.UpdatedAt, now); when != "" {
+			label = when + "  " + label
+		}
+		items = append(items, pickerItem{
+			Label: label,
+			Value: meta.SessionID,
+			Meta:  meta.SessionID,
+		})
+	}
+	if len(items) == 0 {
+		return nil // every resumable session was an empty/failed run
+	}
+	return &commandPicker{
+		kind:     pickerSession,
+		title:    "Resume a session",
+		items:    items,
+		allItems: append([]pickerItem{}, items...),
+		selected: 0,
+	}
+}
+
+// sessionHasResumableContent reports whether a session has anything worth
+// resuming: a tool call/result, or a non-user message with real content (not the
+// no-output guardrail stop). Empty/failed runs return false and are hidden from
+// the picker (they stay on disk). Errors fail open (the session is kept).
+func (m model) sessionHasResumableContent(sessionID string) bool {
+	events, err := m.sessionStore.ReadEvents(sessionID)
+	if err != nil {
+		return true
+	}
+	return eventsHaveResumableContent(events)
+}
+
+// eventsHaveResumableContent reports whether already-loaded events contain
+// anything worth resuming: a tool call/result, or a non-user message with real
+// content (not the no-output guardrail stop). It is the pure core of
+// sessionHasResumableContent so callers that already hold the events (e.g. the
+// /retitle scan) don't re-read them.
+func eventsHaveResumableContent(events []sessions.Event) bool {
+	for _, event := range events {
+		switch event.Type {
+		case sessions.EventToolCall, sessions.EventToolResult:
+			return true
+		case sessions.EventMessage:
+			payload := sessionPayload(event)
+			if strings.EqualFold(payloadString(payload, "role"), "user") {
+				continue
+			}
+			content := strings.TrimSpace(payloadString(payload, "content"))
+			if content != "" && !agent.IsNoProgressStop(content) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// openSessionPicker opens the /resume picker; ok is false when there is nothing to
+// resume (the caller then falls back to the text list / "none" message).
+func (m model) openSessionPicker() (model, bool) {
+	picker := m.newSessionPicker()
+	if picker == nil {
+		return m, false
+	}
+	m.picker = picker
+	return m, true
+}
+
+// newHistoryPicker builds the /history picker: all resumable sessions, newest
+// first. Returns nil when there is no history.
+func (m model) newHistoryPicker() *commandPicker {
+	if m.sessionStore == nil {
+		return nil
+	}
+	metas, err := m.sessionStore.ListResumable()
+	if err != nil || len(metas) == 0 {
+		return nil
+	}
+	now := m.now()
+	items := make([]pickerItem, 0, len(metas))
+	for _, meta := range metas {
+		label := displayValue(meta.Title, "untitled")
+		if when := sessionWhen(meta.UpdatedAt, now); when != "" {
+			label = when + "  " + label
+		}
+		items = append(items, pickerItem{
+			Label: label,
+			Value: meta.SessionID,
+			Meta:  meta.SessionID,
+		})
+	}
+	if len(items) == 0 {
+		return nil
+	}
+	return &commandPicker{
+		kind:     pickerHistory,
+		title:    "History  [Enter] restore · [d] delete · type to search",
+		items:    items,
+		allItems: append([]pickerItem{}, items...),
+		selected: 0,
+	}
+}
+
+// openHistoryPicker opens the /history picker; ok is false when there is no history.
+func (m model) openHistoryPicker() (model, bool) {
+	picker := m.newHistoryPicker()
+	if picker == nil {
+		return m, false
+	}
+	m.picker = picker
+	return m, true
+}
+
+func transcriptRowsFromSessionEvents(events []sessions.Event) []transcriptRow {
+	rows := []transcriptRow{}
+	// Rehydrated rows all carry runID 0, so repeated provider tool-call ids
+	// (e.g. Gemini's per-turn gemini_tool_N) get the same per-occurrence
+	// disambiguation the live runner applies — without it, dedup would drop
+	// every tool card after the first occurrence of an id.
+	callSeq := map[string]int{}
+	// Pre-pass: collect the tool-call ids of Task delegations that actually started
+	// a specialist (each renders as a card below). Only those Task tool-call/result
+	// rows are redundant and skipped; a Task that failed before a specialist started
+	// has no card, so its rows are kept — otherwise the failed delegation vanishes
+	// on resume (M10).
+	specialistToolCalls := map[string]bool{}
+	for _, event := range events {
+		if event.Type == sessions.EventSpecialistStart {
+			if id := payloadString(sessionPayload(event), "toolCallId"); id != "" {
+				specialistToolCalls[id] = true
+			}
+		}
+	}
+	for _, event := range events {
+		payload := sessionPayload(event)
+		switch event.Type {
+		case sessions.EventMessage:
+			role := strings.ToLower(payloadString(payload, "role"))
+			switch role {
+			case "ask_user":
+				rows = append(rows, askUserTranscriptRow(askUserRequestFromPayload(payload)))
+				continue
+			case "ask_user_answers":
+				if text := askUserAnswersText(payload); text != "" {
+					rows = append(rows, transcriptRow{kind: rowSystem, text: text})
+				}
+				continue
+			}
+			content := payloadString(payload, "content")
+			if content == "" {
+				continue
+			}
+			switch role {
+			case "user":
+				rows = append(rows, transcriptRow{kind: rowUser, text: content})
+			case "assistant":
+				// A persisted assistant message was a turn's final answer. Tool/timing
+				// counters were not recorded; the completion line omits those segments.
+				rows = append(rows, transcriptRow{kind: rowAssistant, text: content, final: true})
+			default:
+				rows = append(rows, transcriptRow{kind: rowSystem, text: content})
+			}
+		case sessions.EventToolCall:
+			name := payloadString(payload, "name")
+			if name == "" {
+				name = "unknown"
+			}
+			// Extract the id exactly as the tool-result branch and the specialist
+			// pre-pass do (toolCallId first, then id) so call and result rows key
+			// callSeq/effectiveToolRowID on the same string and the specialist-skip
+			// lookup matches — otherwise a payload that carries toolCallId (not id)
+			// desyncs call→result dedup and the M10 skip (L20).
+			id := firstNonEmptyString(payloadString(payload, "toolCallId"), payloadString(payload, "id"))
+			if name == "Task" && specialistToolCalls[id] {
+				// A specialist card renders this delegation; skip the redundant
+				// "tool call: Task" row. A Task with no specialist (it failed before
+				// one started) keeps its row so the failure stays visible (M10).
+				continue
+			}
+			callSeq[id]++
+			rows = append(rows, transcriptRow{
+				kind:    rowToolCall,
+				id:      effectiveToolRowID(id, callSeq[id]),
+				text:    "tool call: " + name,
+				tool:    name,
+				detail:  argHint(payloadString(payload, "arguments")),
+				arg:     argHintSecondary(payloadString(payload, "arguments")),
+				rawArgs: payloadString(payload, "arguments"),
+			})
+		case sessions.EventPermission, sessions.EventPermissionRequest, sessions.EventPermissionDecision:
+			// Mirror the live path: a silently auto-approved call recorded its
+			// audit event but rendered no row, so don't resurrect one on resume.
+			event := permissionEventFromPayload(payload)
+			if permissionEventIsNoteworthy(event) {
+				rows = append(rows, permissionTranscriptRow(event))
+			}
+		case sessions.EventToolResult:
+			name := payloadString(payload, "name")
+			if name == "" {
+				name = "unknown"
+			}
+			id := firstNonEmptyString(payloadString(payload, "toolCallId"), payloadString(payload, "id"))
+			if name == "Task" && specialistToolCalls[id] {
+				// The specialist card carries this Task's result; skip the redundant
+				// "tool result: Task" row. A Task with no specialist keeps its result
+				// row so a failed delegation's error stays visible (M10).
+				continue
+			}
+			status := tools.Status(payloadString(payload, "status"))
+			if status == "" {
+				status = tools.StatusOK
+			}
+			output := payloadString(payload, "output")
+			rows = append(rows, transcriptRow{
+				kind:         rowToolResult,
+				id:           effectiveToolRowID(id, callSeq[id]),
+				text:         fmt.Sprintf("tool result: %s %s %s", name, status, truncateTUIOutput(output, tuiToolOutputLimit)),
+				tool:         name,
+				status:       status,
+				detail:       output,
+				changedFiles: payloadStringSlice(payload, "changedFiles"),
+			})
+		case sessions.EventError:
+			if message := payloadString(payload, "message"); message != "" {
+				rows = append(rows, transcriptRow{kind: rowError, text: message})
+			}
+		case sessions.EventCompaction:
+			if summary := payloadString(payload, "summary"); summary != "" {
+				rows = append(rows, transcriptRow{kind: rowSystem, text: summary})
+			}
+		case sessions.EventSessionFork:
+			parentID := payloadString(payload, "parentSessionId")
+			if parentID != "" {
+				rows = append(rows, transcriptRow{kind: rowSystem, text: "forked from session: " + parentID})
+			}
+		case sessions.EventSpecialistStart:
+			info := specialistInfoFromPayload(payload)
+			if info != nil {
+				rows = append(rows, transcriptRow{kind: rowSpecialist, specialistInfo: info})
+			}
+		case sessions.EventSpecialistStop:
+			info := specialistInfoFromPayload(payload)
+			if info != nil {
+				// Reconcile: update the existing Start row with the same
+				// childSessionID instead of appending a duplicate. On resume
+				// this prevents two cards per specialist (running + completed).
+				found := false
+				for i := range rows {
+					if rows[i].kind == rowSpecialist && rows[i].specialistInfo != nil &&
+						rows[i].specialistInfo.childSessionID == info.childSessionID {
+						rows[i].specialistInfo = info
+						found = true
+						break
+					}
+				}
+				if !found {
+					rows = append(rows, transcriptRow{kind: rowSpecialist, specialistInfo: info})
+				}
+			}
+		}
+	}
+	return rows
+}
+
+func sessionPayload(event sessions.Event) map[string]any {
+	payload := map[string]any{}
+	if len(event.Payload) == 0 {
+		return payload
+	}
+	_ = json.Unmarshal(event.Payload, &payload)
+	return payload
+}
+
+func permissionEventFromPayload(payload map[string]any) agent.PermissionEvent {
+	name := payloadString(payload, "name")
+	if name == "" {
+		name = payloadString(payload, "toolName")
+	}
+	event := agent.PermissionEvent{
+		ToolCallID:        firstNonEmptyString(payloadString(payload, "toolCallId"), payloadString(payload, "id")),
+		ToolName:          name,
+		Action:            agent.PermissionAction(payloadString(payload, "action")),
+		DecisionAction:    agent.PermissionDecisionAction(payloadString(payload, "decisionAction")),
+		Permission:        payloadString(payload, "permission"),
+		PermissionGranted: payloadBool(payload, "permissionGranted"),
+		PermissionMode:    agent.PermissionMode(payloadString(payload, "permissionMode")),
+		Autonomy:          payloadString(payload, "autonomy"),
+		SideEffect:        payloadString(payload, "sideEffect"),
+		Reason:            payloadString(payload, "reason"),
+		Scope:             payloadString(payload, "scope"),
+		DecisionReason:    payloadString(payload, "decisionReason"),
+		GrantMatched:      payloadBool(payload, "grantMatched"),
+	}
+	if risk, ok := payloadMap(payload, "risk"); ok {
+		event.Risk = sandbox.Risk{
+			Level:  sandbox.RiskLevel(payloadString(risk, "level")),
+			Reason: payloadString(risk, "reason"),
+		}
+	}
+	if block, ok := payloadMap(payload, "block"); ok {
+		event.Block = &sandbox.Block{
+			Code:        sandbox.BlockCode(payloadString(block, "code")),
+			ToolName:    payloadString(block, "toolName"),
+			Action:      sandbox.Action(payloadString(block, "action")),
+			Risk:        event.Risk,
+			Path:        payloadString(block, "path"),
+			Reason:      payloadString(block, "reason"),
+			Recoverable: payloadBool(block, "recoverable"),
+		}
+		if nestedRisk, ok := payloadMap(block, "risk"); ok {
+			event.Block.Risk = sandbox.Risk{
+				Level:  sandbox.RiskLevel(payloadString(nestedRisk, "level")),
+				Reason: payloadString(nestedRisk, "reason"),
+			}
+		}
+	}
+	return event
+}
+
+// askUserRequestFromPayload rebuilds the request persisted by
+// askUserSessionPayload, so ask_user exchanges survive /resume instead of
+// silently vanishing from rehydrated history.
+func askUserRequestFromPayload(payload map[string]any) agent.AskUserRequest {
+	request := agent.AskUserRequest{
+		ToolCallID: payloadString(payload, "toolCallId"),
+		Header:     payloadString(payload, "header"),
+	}
+	raw, ok := payload["questions"].([]any)
+	if !ok {
+		return request
+	}
+	for _, entry := range raw {
+		fields, ok := entry.(map[string]any)
+		if !ok {
+			continue
+		}
+		question := agent.AskUserQuestion{
+			Question:    payloadString(fields, "question"),
+			MultiSelect: payloadBool(fields, "multiSelect"),
+		}
+		if options, ok := fields["options"].([]any); ok {
+			for _, option := range options {
+				if text, ok := option.(string); ok {
+					question.Options = append(question.Options, text)
+				}
+			}
+		}
+		request.Questions = append(request.Questions, question)
+	}
+	return request
+}
+
+// askUserAnswersText renders persisted ask_user answers for rehydration.
+func askUserAnswersText(payload map[string]any) string {
+	raw, ok := payload["answers"].([]any)
+	if !ok {
+		return ""
+	}
+	lines := make([]string, 0, len(raw))
+	for index, entry := range raw {
+		text, _ := entry.(string)
+		if strings.TrimSpace(text) == "" {
+			text = "(skipped)"
+		}
+		lines = append(lines, fmt.Sprintf("%d. %s", index+1, text))
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	return "Answers\n" + strings.Join(lines, "\n")
+}
+
+func payloadString(payload map[string]any, key string) string {
+	value := payload[key]
+	switch typed := value.(type) {
+	case string:
+		return typed
+	case float64, bool:
+		return fmt.Sprint(typed)
+	case nil:
+		return ""
+	default:
+		data, err := json.Marshal(typed)
+		if err != nil {
+			return ""
+		}
+		return string(data)
+	}
+}
+
+// payloadStringSlice reads a []string persisted into a session payload (JSON
+// round-trips it as []any), skipping non-string entries. Nil when absent.
+func payloadStringSlice(payload map[string]any, key string) []string {
+	switch typed := payload[key].(type) {
+	case []string:
+		return typed
+	case []any:
+		out := make([]string, 0, len(typed))
+		for _, v := range typed {
+			if s, ok := v.(string); ok && s != "" {
+				out = append(out, s)
+			}
+		}
+		if len(out) == 0 {
+			return nil
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func payloadBool(payload map[string]any, key string) bool {
+	value := payload[key]
+	switch typed := value.(type) {
+	case bool:
+		return typed
+	case string:
+		return strings.EqualFold(strings.TrimSpace(typed), "true")
+	default:
+		return false
+	}
+}
+
+func payloadMap(payload map[string]any, key string) (map[string]any, bool) {
+	value, ok := payload[key].(map[string]any)
+	return value, ok
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+// specialistInfoFromPayload builds a specialistInfo from a specialist_start or
+// specialist_stop session event payload. Returns nil if the payload lacks a
+// childSessionId (the minimum required field).
+func specialistInfoFromPayload(payload map[string]any) *specialistInfo {
+	childSessionID := payloadString(payload, "childSessionId")
+	if childSessionID == "" {
+		return nil
+	}
+	info := &specialistInfo{
+		name:           payloadString(payload, "specialist"),
+		description:    payloadString(payload, "description"),
+		childSessionID: childSessionID,
+	}
+	statusStr := payloadString(payload, "status")
+	switch statusStr {
+	case "running":
+		info.status = specialistRunning
+	case "success":
+		info.status = specialistCompleted
+	case "completed":
+		info.status = specialistCompleted
+	default:
+		info.status = parseSpecialistStatus(statusStr)
+	}
+	if errMsg := payloadString(payload, "error"); errMsg != "" {
+		info.errorMsg = errMsg
+	}
+	return info
+}

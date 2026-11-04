@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "description": "Text metadata for opt-in multilingual voice smoke tests; no raw audio is stored here.",
+  "fixtures": [
+    {"id":"en-question","language":"en","text":"How do I find the failing test?","kind":"short-question"},
+    {"id":"hi-question","language":"hi","text":"कृपया इस फ़ाइल में लॉगिंग जोड़ें।","kind":"technical"},
+    {"id":"ar-question","language":"ar","text":"كيف أجد سبب فشل الاختبار؟","kind":"short-question"},
+    {"id":"es-question","language":"es","text":"¿Puedes explicar este error de compilación?","kind":"technical"},
+    {"id":"fr-question","language":"fr","text":"Peux-tu vérifier la configuration du projet ?","kind":"technical"},
+    {"id":"de-question","language":"de","text":"Bitte prüfe den Fehler im Parser.","kind":"technical"},
+    {"id":"ja-question","language":"ja","text":"このテストが失敗する理由を説明してください。","kind":"short-question"},
+    {"id":"ko-question","language":"ko","text":"이 파일의 오류 원인을 찾아 주세요.","kind":"technical"},
+    {"id":"zh-question","language":"zh","text":"请解释这个构建错误。","kind":"technical"},
+    {"id":"code-switch","language":"auto","text":"इस function को जल्दी से explain कर दो, please.","kind":"code-switch"},
+    {"id":"punctuation","language":"en","text":"Use Q8_0, 16 kHz, and a 3.14 second timeout.","kind":"punctuation"},
+    {"id":"long-utterance","language":"en","text":"Read the existing configuration, compare the two implementations, explain the tradeoffs, and tell me which option is safest for a local development workflow.","kind":"long"},
+    {"id":"background-noise","language":"en","text":"Can you summarize the release steps?","kind":"background-noise"},
+    {"id":"silence","language":"none","text":"","kind":"silence"}
+  ]
+}

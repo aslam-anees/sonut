@@ -1,0 +1,43 @@
+{
+  "name": "@aistatine/atcode",
+  "version": "1.2.0",
+  "description": "atcode \u2014 local-first AI coding agent powered by the atcode engine.",
+  "type": "module",
+  "module": "bin/atcode.js",
+  "bin": {
+    "at": "bin/atcode.js",
+    "atcode": "bin/atcode.js"
+  },
+  "scripts": {
+    "postinstall": "node scripts/postinstall.mjs"
+  },
+  "files": [
+    "bin/atcode.js",
+    "scripts/postinstall.mjs"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "agent-browser": "^0.30.1",
+    "tuistory": "^0.10.0"
+  },
+  "os": [
+    "linux",
+    "darwin",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aslam-anees/sonut.git"
+  },
+  "homepage": "https://github.com/aslam-anees/sonut#readme",
+  "bugs": {
+    "url": "https://github.com/aslam-anees/sonut/issues"
+  },
+  "license": "MIT"
+}

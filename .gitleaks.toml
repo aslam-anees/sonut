@@ -1,0 +1,202 @@
+# Exact reviewed synthetic fixtures and two Windows WFP GUIDs.
+# No directory-wide exclusions; default detectors remain enabled.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Reviewed synthetic test fixture or Windows WFP GUID"
+condition = "AND"
+regexTarget = "secret"
+paths = ['''^internal/cli/observability_test\.go$''']
+regexes = ['''^sk\-secret1234567890$''']
+
+[[allowlists]]
+description = "Reviewed synthetic test fixture or Windows WFP GUID"
+condition = "AND"
+regexTarget = "secret"
+paths = ['''^internal/config/validate_test\.go$''']
+regexes = ['''^sk\-proj\-secret1234567890$''']
+
+[[allowlists]]
+description = "Reviewed synthetic test fixture or Windows WFP GUID"
+condition = "AND"
+regexTarget = "secret"
+paths = ['''^internal/evolution/evolution_test\.go$''']
+regexes = ['''^apiKey=sk\-test\-1234567890$''']
+
+[[allowlists]]
+description = "Reviewed synthetic test fixture or Windows WFP GUID"
+condition = "AND"
+regexTarget = "secret"
+paths = ['''^internal/agent/loop_test\.go$''']
+regexes = ['''^sk\-proj\-ABCDEFGHIJKLMNOP1234567890$''']
+
+[[allowlists]]
+description = "Reviewed synthetic test fixture or Windows WFP GUID"
+condition = "AND"
+regexTarget = "secret"
+paths = ['''^internal/doctor/doctor_test\.go$''']
+regexes = ['''^sk\-proj\-secret1234567890$''']
+
+[[allowlists]]
+description = "Reviewed synthetic test fixture or Windows WFP GUID"
+condition = "AND"
+regexTarget = "secret"
+paths = ['''^internal/notify/slack_test\.go$''']
+regexes = ['''^xoxb\-123456789012\-abcdefghijklmno$''']
+
+[[allowlists]]
+description = "Reviewed synthetic test fixture or Windows WFP GUID"
+condition = "AND"
+regexTarget = "secret"
+paths = ['''^internal/notify/slack_test\.go$''']
+regexes = ['''^xoxb\-123456789012\-abcdefghijklmno$''']
+
+[[allowlists]]
+description = "Reviewed synthetic test fixture or Windows WFP GUID"
+condition = "AND"
+regexTarget = "secret"
+paths = ['''^internal/redaction/redaction_test\.go$''']
+regexes = ['''^glpat\-abcdefghijklmnopqrst$''']
+
+[[allowlists]]
+description = "Reviewed synthetic test fixture or Windows WFP GUID"
+condition = "AND"
+regexTarget = "secret"
+paths = ['''^internal/redaction/redaction_test\.go$''']
+regexes = ['''^glpat\-abcdefghijklmnopqrst$''']
+
+[[allowlists]]
+description = "Reviewed synthetic test fixture or Windows WFP GUID"
+condition = "AND"
+regexTarget = "secret"
+paths = ['''^internal/redaction/redaction_test\.go$''']
+regexes = ['''^sk\-test\-secret1234567890$''']
+
+[[allowlists]]
+description = "Reviewed synthetic test fixture or Windows WFP GUID"
+condition = "AND"
+regexTarget = "secret"
+paths = ['''^internal/search/search_test\.go$''']
+regexes = ['''^sk\-secret1234567890$''']
+
+[[allowlists]]
+description = "Reviewed synthetic test fixture or Windows WFP GUID"
+condition = "AND"
+regexTarget = "secret"
+paths = ['''^internal/sec/diff_sarif_test\.go$''']
+regexes = ['''^AKIAABCDEFGHIJKLMNOP$''']
+
+[[allowlists]]
+description = "Reviewed synthetic test fixture or Windows WFP GUID"
+condition = "AND"
+regexTarget = "secret"
+paths = ['''^internal/sandbox/windows_network\.go$''']
+regexes = ['''^2e31d31c\-3948\-4753\-9117\-e5d1a6496f41$''']
+
+[[allowlists]]
+description = "Reviewed synthetic test fixture or Windows WFP GUID"
+condition = "AND"
+regexTarget = "secret"
+paths = ['''^internal/sandbox/windows_network\.go$''']
+regexes = ['''^e65054fd\-4d32\-4c7c\-95ef\-621f0cf6431a$''']
+
+[[allowlists]]
+description = "Reviewed synthetic test fixture or Windows WFP GUID"
+condition = "AND"
+regexTarget = "secret"
+paths = ['''^internal/security/security_test\.go$''']
+regexes = ['''^AKIAABCDEFGHIJKLMNOP$''']
+
+[[allowlists]]
+description = "Reviewed synthetic test fixture or Windows WFP GUID"
+condition = "AND"
+regexTarget = "secret"
+paths = ['''^internal/security/security_test\.go$''']
+regexes = ['''^AKIAABCDEFGHIJKLMNOP$''']
+
+[[allowlists]]
+description = "Reviewed synthetic test fixture or Windows WFP GUID"
+condition = "AND"
+regexTarget = "secret"
+paths = ['''^internal/sec/scanner_test\.go$''']
+regexes = ['''^AKIAABCDEFGHIJKLMNOP$''']
+
+[[allowlists]]
+description = "Reviewed synthetic test fixture or Windows WFP GUID"
+condition = "AND"
+regexTarget = "secret"
+paths = ['''^internal/secrets/scanner_test\.go$''']
+regexes = ['''^AIzaSyA1234567890abcdefghijklmnopqrstuv$''']
+
+[[allowlists]]
+description = "Reviewed synthetic test fixture or Windows WFP GUID"
+condition = "AND"
+regexTarget = "secret"
+paths = ['''^internal/secrets/scanner_test\.go$''']
+regexes = ['''^AKIAABCDEFGHIJKLMNOP$''']
+
+[[allowlists]]
+description = "Reviewed synthetic test fixture or Windows WFP GUID"
+condition = "AND"
+regexTarget = "secret"
+paths = ['''^internal/secrets/scanner_test\.go$''']
+regexes = ['''^\-\-\-\-\-BEGIN\ OPENSSH\ PRIVATE\ KEY\-\-\-\-\-\\nb3BlbnNzaC1rZXktdjEAAAAB\\n\-\-\-\-\-END\ OPENSSH\ PRIVATE\ KEY\-\-\-\-\-",\
+\	\}\
+\	for\ wantType,\ secret\ :=\ range\ cases\ \{\
+\	\	text\ :=\ "log\ line\ before\ "\ \+\ secret\ \+\ "\ and\ after"\
+\	\	findings\ :=\ Scan\(text\)\
+\	\	if\ len\(findings\)\ ==\ 0\ \{\
+\	\	\	t\.Errorf\("%s:\ expected\ a\ finding\ for\ %q",\ wantType,\ secret\)\
+\	\	\	continue\
+\	\	\}\
+\	\	if\ findings\[0\]\.Type\ !=\ wantType\ \{\
+\	\	\	t\.Errorf\("%s:\ got\ type\ %q\ for\ %q",\ wantType,\ findings\[0\]\.Type,\ secret\)\
+\	\	\}\
+\	\}\
+\}\
+\
+func\ TestRedactPrivateKeyBlockRemovesBody\(t\ \*testing\.T\)\ \{\
+\	key\ :=\ "\-\-\-\-\-BEGIN\ RSA\ PRIVATE\ KEY\-\-\-\-\-$''']
+
+[[allowlists]]
+description = "Reviewed synthetic test fixture or Windows WFP GUID"
+condition = "AND"
+regexTarget = "secret"
+paths = ['''^internal/test/helpers\.go$''']
+regexes = ['''^eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9$''']
+
+[[allowlists]]
+description = "Reviewed synthetic test fixture or Windows WFP GUID"
+condition = "AND"
+regexTarget = "secret"
+paths = ['''^internal/redaction/audit_fixes_test\.go$''']
+regexes = ['''^rk_live_plaintextvalue$''']
+
+[[allowlists]]
+description = "Reviewed synthetic test fixture or Windows WFP GUID"
+condition = "AND"
+regexTarget = "secret"
+paths = ['''^internal/redaction/audit_fixes_test\.go$''']
+regexes = ['''^rk_live_plaintextvalue$''']
+
+[[allowlists]]
+description = "Reviewed synthetic test fixture or Windows WFP GUID"
+condition = "AND"
+regexTarget = "secret"
+paths = ['''^internal/tools/web_search_test\.go$''']
+regexes = ['''^sk\-livesecret0123456789abcdef$''']
+
+[[allowlists]]
+description = "Reviewed synthetic test fixture or Windows WFP GUID"
+condition = "AND"
+regexTarget = "secret"
+paths = ['''^internal/streamjson/streamjson_test\.go$''']
+regexes = ['''^abcdefghijklmnop1234567890$''']
+
+[[allowlists]]
+description = "Reviewed synthetic test fixture or Windows WFP GUID"
+condition = "AND"
+regexTarget = "secret"
+paths = ['''^internal/streamjson/streamjson_test\.go$''']
+regexes = ['''^sk\-svcacct\-zyxwvutsrq012345$''']

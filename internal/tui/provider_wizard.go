@@ -1,0 +1,1693 @@
+package tui
+
+import (
+	"context"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+	"unicode"
+
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
+
+	"github.com/aistatine/sonut/internal/browser"
+	"github.com/aistatine/sonut/internal/config"
+	"github.com/aistatine/sonut/internal/oauth"
+	"github.com/aistatine/sonut/internal/providercatalog"
+	"github.com/aistatine/sonut/internal/provideroauth"
+	"github.com/aistatine/sonut/internal/redaction"
+	"github.com/aistatine/sonut/internal/sonutruntime"
+)
+
+// providerWizardOAuthMsg carries the result of an in-wizard browser OAuth login.
+// apiKey is set when the flow mints a key (OpenRouter); tokenLogin is set when the
+// flow stored an OAuth token in the oauth store (xAI) that the runtime resolver
+// will attach — in that case no key is needed on the profile.
+type providerWizardOAuthMsg struct {
+	providerID string
+	attemptID  int
+	apiKey     string
+	tokenLogin bool
+	err        error
+}
+
+// applyProviderWizardOAuth folds an OAuth login result into the wizard: on
+// success the minted key fills the credential and the wizard advances; on failure
+// the (redacted) error is shown and the user can retry or paste a key.
+func (m model) applyProviderWizardOAuth(msg providerWizardOAuthMsg) (model, tea.Cmd) {
+	if m.providerWizard == nil || !m.providerWizard.oauthResultMatches(msg.providerID, msg.attemptID) {
+		return m, nil
+	}
+	m.providerWizard.oauthPending = false
+	if msg.err != nil {
+		m.providerWizard.oauthErr = redaction.ErrorMessage(msg.err, redaction.Options{})
+		return m, nil
+	}
+	if msg.apiKey != "" {
+		m.providerWizard.apiKey = msg.apiKey
+	}
+	// OAuth succeeded (key minted, or a refreshable token stored for the runtime
+	// resolver). Skip the endpoint/credential steps and go straight to model
+	// selection.
+	m.providerWizard.err = ""
+	m.providerWizard.oauthErr = ""
+	m.providerWizard.oauthDevice = false
+	m.providerWizard.deviceUserCode = ""
+	m.providerWizard.deviceVerificationURI = ""
+	m.providerWizard.step = providerWizardStepModel
+	return m, m.providerModelDiscoveryCmd()
+}
+
+// applyProviderWizardDeviceCode handles phase 1 of device-code login: show the
+// user_code + verification URI, then kick off phase 2 (the token poll). On error
+// the redacted message is surfaced and the login is abandoned.
+func (m model) applyProviderWizardDeviceCode(msg providerWizardDeviceCodeMsg) (model, tea.Cmd) {
+	if m.providerWizard == nil || !m.providerWizard.oauthResultMatches(msg.providerID, msg.attemptID) {
+		return m, nil
+	}
+	if msg.err != nil {
+		m.providerWizard.oauthPending = false
+		m.providerWizard.oauthDevice = false
+		m.providerWizard.oauthErr = redaction.ErrorMessage(msg.err, redaction.Options{})
+		return m, nil
+	}
+	m.providerWizard.deviceUserCode = msg.userCode
+	m.providerWizard.deviceVerificationURI = msg.verifyURL
+	return m, providerWizardDevicePollCmd(msg.providerID, msg.attemptID, msg.cfg, msg.auth)
+}
+
+// providerWizardSupportsOAuth reports whether the credential step should offer a
+// browser "Log in with OAuth" option for this provider. Only providers whose
+// OAuth flow yields a credential usable directly (OpenRouter mints an API key)
+// are offered — subscription providers (ChatGPT/Claude) use the proxy preset, and
+// API-key-only providers just paste a key.
+func providerWizardSupportsOAuth(provider providercatalog.Descriptor) bool {
+	return provider.OAuth
+}
+
+// providerWizardOAuthCmdFor runs the chosen provider's browser OAuth login off the
+// UI goroutine and reports the outcome. OpenRouter mints an API key; ChatGPT
+// (Codex) needs the bespoke flow that extracts the `chatgpt_account_id` claim
+// from the ID token and stores it on the saved token so the Codex provider can
+// inject it as a header on every request; other OAuth providers (xAI) run the
+// generic engine login which stores a refreshable token.
+func providerWizardOAuthCmdFor(provider providercatalog.Descriptor, attemptID int) tea.Cmd {
+	providerID := provider.ID
+	switch {
+	case provider.OAuthMintsKey:
+		return func() tea.Msg {
+			key, err := provideroauth.OpenRouterLogin(context.Background(), provideroauth.OpenRouterOptions{
+				OpenBrowser: browser.OpenURL,
+				Timeout:     3 * time.Minute,
+			})
+			return providerWizardOAuthMsg{providerID: providerID, attemptID: attemptID, apiKey: key, err: err}
+		}
+	case providerID == "chatgpt":
+		return func() tea.Msg {
+			err := runProviderChatGPTLogin()
+			return providerWizardOAuthMsg{providerID: providerID, attemptID: attemptID, tokenLogin: true, err: err}
+		}
+	default:
+		return func() tea.Msg {
+			return providerWizardOAuthMsg{providerID: providerID, attemptID: attemptID, tokenLogin: true, err: runProviderTokenLogin(providerID)}
+		}
+	}
+}
+
+// runProviderChatGPTLogin runs the ChatGPT (Codex) bespoke login (which
+// extracts the `chatgpt_account_id` claim from the ID token and stores it on
+// the token's Account field) and persists the resulting token via the oauth
+// store. The runtime resolver then attaches the bearer to Codex calls and the
+// Codex provider reads the Account field for the `chatgpt-account-id` header.
+func runProviderChatGPTLogin() error {
+	env := buildOAuthPresetEnv()
+	token, err := provideroauth.ChatGPTLogin(context.Background(), provideroauth.ChatGPTOptions{
+		Env:         env,
+		HTTPClient:  &http.Client{Timeout: 60 * time.Second},
+		OpenBrowser: browser.OpenURL,
+		Timeout:     3 * time.Minute,
+	})
+	if err != nil {
+		return err
+	}
+	store, err := oauth.NewStore(oauth.StoreOptions{})
+	if err != nil {
+		return err
+	}
+	return store.Save(oauth.ProviderKey("chatgpt"), token)
+}
+
+// buildOAuthPresetEnv layers the process env with the preset opt-in so a
+// `sonut` launch from a TUI session can use the baked-in ChatGPT client_id
+// without requiring the user to export SONUT_OAUTH_ALLOW_PRESETS themselves.
+func buildOAuthPresetEnv() map[string]string {
+	env := map[string]string{}
+	for _, kv := range os.Environ() {
+		if eq := strings.IndexByte(kv, '='); eq > 0 {
+			env[kv[:eq]] = kv[eq+1:]
+		}
+	}
+	env["SONUT_OAUTH_ALLOW_PRESETS"] = "1"
+	return env
+}
+
+// runProviderTokenLogin runs the generic OAuth engine login for a provider that
+// has a built-in preset (e.g. xAI), storing a refreshable token under
+// provider:<name>. The runtime resolver then attaches it to model calls.
+func runProviderTokenLogin(name string) error {
+	store, err := oauth.NewStore(oauth.StoreOptions{})
+	if err != nil {
+		return err
+	}
+	manager, err := oauth.NewManager(oauth.ManagerOptions{
+		Store:       store,
+		HTTPClient:  &http.Client{Timeout: 60 * time.Second},
+		OpenBrowser: browser.OpenURL,
+		// The user explicitly chose to sign in with this provider's OAuth, so opt
+		// into its baked-in preset (e.g. xAI's public client_id); without this the
+		// config never resolves and the browser never opens.
+		AllowPresets: true,
+	})
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	_, err = manager.Login(ctx, oauth.LoginOptions{Provider: name})
+	return err
+}
+
+// providerWizardDeviceCodeMsg carries the result of phase 1 (RequestDeviceCode):
+// the user_code + verification URI to display, plus the cfg/auth to poll with.
+type providerWizardDeviceCodeMsg struct {
+	providerID string
+	attemptID  int
+	userCode   string
+	verifyURL  string
+	cfg        oauth.Config
+	auth       oauth.DeviceAuth
+	err        error
+}
+
+// providerWizardDevicePrepareCmd runs phase 1 of the device-code login off the UI
+// goroutine and reports the code to display (or an error).
+func providerWizardDevicePrepareCmd(name string, attemptID int) tea.Cmd {
+	return func() tea.Msg {
+		auth, cfg, err := oauthDevicePrepare(name)
+		if err != nil {
+			return providerWizardDeviceCodeMsg{providerID: name, attemptID: attemptID, err: err}
+		}
+		return providerWizardDeviceCodeMsg{
+			providerID: name,
+			attemptID:  attemptID,
+			userCode:   auth.UserCode,
+			verifyURL:  oauthDeviceVerifyTarget(auth),
+			cfg:        cfg,
+			auth:       auth,
+		}
+	}
+}
+
+// providerWizardDevicePollCmd runs phase 2 (poll for the token + store) off the
+// UI goroutine and reports completion as a regular OAuth result.
+func providerWizardDevicePollCmd(name string, attemptID int, cfg oauth.Config, auth oauth.DeviceAuth) tea.Cmd {
+	return func() tea.Msg {
+		return providerWizardOAuthMsg{providerID: name, attemptID: attemptID, tokenLogin: true, err: oauthDeviceComplete(name, cfg, auth)}
+	}
+}
+
+// startProviderDeviceLogin begins the device-code flow for the selected OAuth
+// provider (phase 1). Used by the headless default and the "d" shortcut.
+func (m model) startProviderDeviceLogin() (model, tea.Cmd) {
+	provider := m.providerWizard.currentProvider()
+	if !provider.OAuth || !provider.OAuthDeviceFlow {
+		return m, nil
+	}
+	attemptID := m.providerWizard.beginOAuthAttempt(true)
+	return m, providerWizardDevicePrepareCmd(provider.ID, attemptID)
+}
+
+const maxProviderWizardProvidersVisible = 10
+const maxProviderWizardModelsVisible = 10
+const providerWizardMinWidth = 48
+const providerWizardProviderWidth = 64
+const providerWizardMediumWidth = 86
+const providerWizardModelWidth = 92
+
+type providerWizardStep int
+
+const (
+	providerWizardStepMethod providerWizardStep = iota
+	providerWizardStepProvider
+	providerWizardStepManageKey
+	providerWizardStepEndpoint
+	providerWizardStepName
+	providerWizardStepCredential
+	providerWizardStepModel
+	providerWizardStepDone
+)
+
+// providerWizardMethodOption is a row in the "How do you want to connect?" step.
+type providerWizardMethodOption struct {
+	oauth    bool
+	label    string
+	subtitle string
+}
+
+// providerWizardMethodOptions returns the connect-method rows. OAuth is listed
+// first (and is the default) when any OAuth-capable provider exists.
+func providerWizardMethodOptions() []providerWizardMethodOption {
+	options := []providerWizardMethodOption{}
+	if len(providercatalog.OAuthProviders()) > 0 {
+		options = append(options, providerWizardMethodOption{
+			oauth:    true,
+			label:    "Sign in with OAuth",
+			subtitle: "One-click browser login, no API key to copy (OpenRouter, xAI, ChatGPT, Hugging Face).",
+		})
+	}
+	options = append(options, providerWizardMethodOption{
+		oauth:    false,
+		label:    "Paste an API key / browse providers",
+		subtitle: "Any of 20+ providers, a local model, or a subscription via proxy.",
+	})
+	return options
+}
+
+// providerWizardOAuthDescriptors returns the OAuth-capable providers as the
+// wizard's provider list (used after the OAuth method is chosen). ChatGPT/Claude
+// are deliberately not here — they can't do real in-app OAuth (see
+// docs/oauth-subscriptions.md); use "browse" + a local proxy for those.
+func providerWizardOAuthDescriptors() []providercatalog.Descriptor {
+	return providercatalog.OAuthProviders()
+}
+
+type providerWizardModel struct {
+	ID          string
+	Description string
+	Meta        string
+}
+
+type providerWizardState struct {
+	step             providerWizardStep
+	providers        []providercatalog.Descriptor
+	selectedProvider int
+	models           []providerWizardModel
+	selectedModel    int
+	modelSearch      string
+	baseURL          string
+	profileName      string
+	apiKey           string
+	err              string
+	modelSource      string
+	modelLoading     bool
+	modelLoadError   string
+	discoveryToken   int
+	selectedMethod   int
+	// Manage-key step: shown when the selected provider already has a stored key.
+	manageKeyCursor    int
+	manageProviderName string
+	oauthMode          bool
+	oauthPending       bool
+	oauthAttemptID     int
+	oauthErr           string
+	// Device-code login (RFC 8628) state while an OAuth login is in flight.
+	oauthDevice           bool
+	deviceUserCode        string
+	deviceVerificationURI string
+}
+
+func (m model) newProviderWizard() *providerWizardState {
+	providers := providerWizardProviders()
+	wizard := &providerWizardState{
+		step:             providerWizardStepMethod,
+		providers:        providers,
+		selectedProvider: 0,
+	}
+	wizard.refreshModels()
+	return wizard
+}
+
+func providerWizardProviders() []providercatalog.Descriptor {
+	providers := []providercatalog.Descriptor{}
+	for _, descriptor := range providercatalog.All() {
+		if !providercatalog.RuntimeSupported(descriptor) {
+			continue
+		}
+		providers = append(providers, descriptor)
+	}
+	return providers
+}
+
+func (wizard *providerWizardState) currentProvider() providercatalog.Descriptor {
+	if wizard == nil || len(wizard.providers) == 0 {
+		return providercatalog.Descriptor{}
+	}
+	wizard.selectedProvider = clampInt(wizard.selectedProvider, 0, len(wizard.providers)-1)
+	return wizard.providers[wizard.selectedProvider]
+}
+
+func (wizard *providerWizardState) beginOAuthAttempt(device bool) int {
+	wizard.oauthAttemptID++
+	wizard.oauthPending = true
+	wizard.oauthDevice = device
+	wizard.oauthErr = ""
+	wizard.deviceUserCode = ""
+	wizard.deviceVerificationURI = ""
+	return wizard.oauthAttemptID
+}
+
+func (wizard *providerWizardState) oauthResultMatches(providerID string, attemptID int) bool {
+	if wizard == nil || !wizard.oauthPending || strings.TrimSpace(providerID) == "" {
+		return false
+	}
+	return wizard.currentProvider().ID == providerID && wizard.oauthAttemptID == attemptID
+}
+
+func (wizard *providerWizardState) currentModel() providerWizardModel {
+	if wizard == nil {
+		return providerWizardModel{}
+	}
+	if providerWizardUsesTypedModel(wizard.currentProvider()) {
+		modelID := strings.TrimSpace(wizard.modelSearch)
+		if modelID == "" {
+			return providerWizardModel{Description: "model name required"}
+		}
+		return providerWizardModel{ID: modelID, Description: "custom model"}
+	}
+	wizard.refreshModels()
+	models := wizard.filteredModels()
+	if len(models) == 0 {
+		return providerWizardModel{Description: "no matching models"}
+	}
+	wizard.selectedModel = clampInt(wizard.selectedModel, 0, len(models)-1)
+	return models[wizard.selectedModel]
+}
+
+func (wizard *providerWizardState) move(delta int) {
+	if wizard == nil {
+		return
+	}
+	switch wizard.step {
+	case providerWizardStepMethod:
+		options := providerWizardMethodOptions()
+		if len(options) == 0 {
+			return
+		}
+		wizard.selectedMethod = ((wizard.selectedMethod+delta)%len(options) + len(options)) % len(options)
+	case providerWizardStepProvider:
+		if len(wizard.providers) == 0 {
+			return
+		}
+		wizard.selectedProvider = ((wizard.selectedProvider+delta)%len(wizard.providers) + len(wizard.providers)) % len(wizard.providers)
+		wizard.selectedModel = 0
+		wizard.modelSearch = ""
+		wizard.baseURL = ""
+		wizard.profileName = ""
+		wizard.apiKey = ""
+		wizard.err = ""
+		wizard.modelSource = ""
+		wizard.modelLoading = false
+		wizard.modelLoadError = ""
+		wizard.oauthPending = false
+		wizard.oauthErr = ""
+		wizard.refreshModels()
+	case providerWizardStepModel:
+		wizard.refreshModels()
+		models := wizard.filteredModels()
+		if len(models) == 0 {
+			return
+		}
+		wizard.selectedModel = ((wizard.selectedModel+delta)%len(models) + len(models)) % len(models)
+	}
+}
+
+func (wizard *providerWizardState) advance() {
+	if wizard == nil {
+		return
+	}
+	switch wizard.step {
+	case providerWizardStepMethod:
+		options := providerWizardMethodOptions()
+		wizard.selectedMethod = clampInt(wizard.selectedMethod, 0, maxInt(0, len(options)-1))
+		wizard.err = ""
+		if len(options) > 0 && options[wizard.selectedMethod].oauth {
+			wizard.oauthMode = true
+			wizard.providers = providerWizardOAuthDescriptors()
+		} else {
+			wizard.oauthMode = false
+			wizard.providers = providerWizardProviders()
+		}
+		wizard.selectedProvider = 0
+		wizard.refreshModels()
+		wizard.step = providerWizardStepProvider
+	case providerWizardStepProvider:
+		// In OAuth mode, advancing starts the browser/device login (dispatched by
+		// advanceProviderWizard at the model level), not the key/endpoint flow.
+		if wizard.oauthMode {
+			return
+		}
+		wizard.refreshModels()
+		wizard.err = ""
+		if providerWizardNeedsEndpoint(wizard.currentProvider()) {
+			wizard.step = providerWizardStepEndpoint
+		} else if providerWizardNeedsCredential(wizard.currentProvider()) {
+			wizard.step = providerWizardStepCredential
+		} else {
+			wizard.step = providerWizardStepModel
+		}
+	case providerWizardStepEndpoint:
+		wizard.err = ""
+		if err := providerWizardEndpointError(wizard.baseURL); err != "" {
+			wizard.err = err
+			return
+		}
+		wizard.step = providerWizardStepName
+	case providerWizardStepName:
+		wizard.err = ""
+		if providerWizardNeedsCredential(wizard.currentProvider()) {
+			wizard.step = providerWizardStepCredential
+		} else {
+			wizard.step = providerWizardStepModel
+		}
+	case providerWizardStepCredential:
+		wizard.err = ""
+		wizard.step = providerWizardStepModel
+	case providerWizardStepModel:
+		wizard.err = ""
+		if providerWizardUsesTypedModel(wizard.currentProvider()) {
+			if strings.TrimSpace(wizard.modelSearch) == "" {
+				wizard.err = "enter a model name before continuing"
+				return
+			}
+			wizard.step = providerWizardStepDone
+			return
+		}
+		if wizard.modelLoading {
+			wizard.err = "Models are still loading."
+			return
+		}
+		wizard.refreshModels()
+		if len(wizard.filteredModels()) == 0 {
+			wizard.err = "choose a matching model before continuing"
+			return
+		}
+		wizard.step = providerWizardStepDone
+	case providerWizardStepDone:
+		wizard.step = providerWizardStepProvider
+	}
+}
+
+func (wizard *providerWizardState) retreat() {
+	if wizard == nil {
+		return
+	}
+	wizard.err = ""
+	switch wizard.step {
+	case providerWizardStepProvider:
+		wizard.oauthMode = false
+		wizard.oauthErr = ""
+		wizard.step = providerWizardStepMethod
+	case providerWizardStepEndpoint:
+		wizard.step = providerWizardStepProvider
+	case providerWizardStepName:
+		wizard.step = providerWizardStepEndpoint
+	case providerWizardStepCredential:
+		if providerWizardNeedsProfileName(wizard.currentProvider()) {
+			wizard.step = providerWizardStepName
+		} else if providerWizardNeedsEndpoint(wizard.currentProvider()) {
+			wizard.step = providerWizardStepEndpoint
+		} else {
+			wizard.step = providerWizardStepProvider
+		}
+	case providerWizardStepModel:
+		if providerWizardNeedsCredential(wizard.currentProvider()) {
+			wizard.step = providerWizardStepCredential
+		} else if providerWizardNeedsEndpoint(wizard.currentProvider()) {
+			wizard.step = providerWizardStepEndpoint
+		} else {
+			wizard.step = providerWizardStepProvider
+		}
+	case providerWizardStepDone:
+		wizard.step = providerWizardStepModel
+	}
+}
+
+func (wizard *providerWizardState) refreshModels() {
+	if wizard == nil {
+		return
+	}
+	provider := wizard.currentProvider()
+	if providerWizardUsesTypedModel(provider) {
+		return
+	}
+	if wizard.modelSource != "" && wizard.modelSource != "fallback" {
+		wizard.selectedModel = clampInt(wizard.selectedModel, 0, maxInt(0, len(wizard.models)-1))
+		return
+	}
+	models := providerWizardModelOptions(provider)
+	if sameProviderWizardModels(wizard.models, models) {
+		wizard.selectedModel = clampInt(wizard.selectedModel, 0, maxInt(0, len(models)-1))
+		return
+	}
+	wizard.models = models
+	wizard.selectedModel = 0
+	wizard.modelSource = "fallback"
+}
+
+func sameProviderWizardModels(a, b []providerWizardModel) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for index := range a {
+		if a[index].ID != b[index].ID {
+			return false
+		}
+	}
+	return true
+}
+
+func providerWizardNeedsCredential(provider providercatalog.Descriptor) bool {
+	return provider.RequiresAuth && !provider.Local && len(provider.AuthEnvVars) > 0
+}
+
+func providerWizardNeedsEndpoint(provider providercatalog.Descriptor) bool {
+	switch provider.ID {
+	case "custom-openai-compatible", "custom-anthropic-compatible":
+		return true
+	default:
+		return false
+	}
+}
+
+func providerWizardUsesTypedModel(provider providercatalog.Descriptor) bool {
+	return providerWizardNeedsEndpoint(provider)
+}
+
+func providerWizardNeedsProfileName(provider providercatalog.Descriptor) bool {
+	return providerWizardNeedsEndpoint(provider)
+}
+
+func (m model) handleProviderWizardKey(msg tea.KeyMsg) (model, tea.Cmd) {
+	if m.providerWizard == nil {
+		return m, nil
+	}
+	// While a browser/device OAuth login is in flight, ignore input except Esc,
+	// which abandons the wizard (the background flow times out and is dropped).
+	if m.providerWizard.oauthPending {
+		if keyIs(msg, tea.KeyEsc) {
+			m.providerWizard = nil
+		}
+		return m, nil
+	}
+	// Manage-key step: keep/replace/remove a provider's stored key.
+	if m.providerWizard.step == providerWizardStepManageKey {
+		switch {
+		case keyIs(msg, tea.KeyEsc) || keyIs(msg, tea.KeyLeft):
+			m.providerWizard.step = providerWizardStepProvider
+			m.providerWizard.err = ""
+			return m, nil
+		case keyIs(msg, tea.KeyUp):
+			m.providerWizard.manageKeyCursor = (m.providerWizard.manageKeyCursor + 2) % 3
+			return m, nil
+		case keyIs(msg, tea.KeyDown) || keyIs(msg, tea.KeyTab):
+			m.providerWizard.manageKeyCursor = (m.providerWizard.manageKeyCursor + 1) % 3
+			return m, nil
+		case keyIs(msg, tea.KeyEnter):
+			return m.applyManageKeyChoice()
+		}
+		return m, nil
+	}
+	// On the OAuth provider list, "d" forces device-code login for a device-capable
+	// provider (xAI) — useful on a desktop when the browser flow won't work.
+	if m.providerWizard.step == providerWizardStepProvider && m.providerWizard.oauthMode &&
+		(keyText(msg) == "d" || keyText(msg) == "D") &&
+		m.providerWizard.currentProvider().OAuthDeviceFlow {
+		return m.startProviderDeviceLogin()
+	}
+	if m.providerWizard.step == providerWizardStepEndpoint {
+		switch {
+		case keyText(msg) != "":
+			m.providerWizard.appendBaseURL(keyRunes(msg))
+			return m, nil
+		case keyBackspace(msg):
+			m.providerWizard.deleteBaseURLRune()
+			return m, nil
+		case keyCtrl(msg, 'u'):
+			m.providerWizard.baseURL = ""
+			m.providerWizard.err = ""
+			return m, nil
+		case keyIs(msg, tea.KeyLeft):
+			m.providerWizard.retreat()
+			return m, nil
+		case keyIs(msg, tea.KeyRight):
+			if m.providerWizard.canAdvanceWithRight() {
+				return m.advanceProviderWizard()
+			}
+			return m, nil
+		case keyIs(msg, tea.KeyEnter):
+			return m.advanceProviderWizard()
+		}
+	}
+	if m.providerWizard.step == providerWizardStepName {
+		switch {
+		case keyText(msg) != "":
+			m.providerWizard.appendProfileName(keyRunes(msg))
+			return m, nil
+		case keyBackspace(msg):
+			m.providerWizard.deleteProfileNameRune()
+			return m, nil
+		case keyCtrl(msg, 'u'):
+			m.providerWizard.profileName = ""
+			m.providerWizard.err = ""
+			return m, nil
+		case keyIs(msg, tea.KeyLeft):
+			m.providerWizard.retreat()
+			return m, nil
+		case keyIs(msg, tea.KeyRight) || keyIs(msg, tea.KeyEnter):
+			return m.advanceProviderWizard()
+		}
+	}
+	if m.providerWizard.step == providerWizardStepCredential {
+		switch {
+		case keyIs(msg, tea.KeyEsc):
+			m.providerWizard = nil
+			return m, nil
+		case keyCtrl(msg, 'o'):
+			if providerWizardSupportsOAuth(m.providerWizard.currentProvider()) {
+				provider := m.providerWizard.currentProvider()
+				attemptID := m.providerWizard.beginOAuthAttempt(false)
+				return m, providerWizardOAuthCmdFor(provider, attemptID)
+			}
+			return m, nil
+		case keyText(msg) != "":
+			m.providerWizard.appendAPIKey(keyRunes(msg))
+			return m, nil
+		case keyBackspace(msg):
+			m.providerWizard.deleteAPIKeyRune()
+			return m, nil
+		case keyCtrl(msg, 'u'):
+			m.providerWizard.apiKey = ""
+			return m, nil
+		case keyIs(msg, tea.KeyLeft):
+			m.providerWizard.retreat()
+			return m, nil
+		case keyIs(msg, tea.KeyRight):
+			if m.providerWizard.canAdvanceWithRight() {
+				return m.advanceProviderWizard()
+			}
+			return m, nil
+		case keyIs(msg, tea.KeyEnter):
+			return m.advanceProviderWizard()
+		}
+		return m, nil
+	}
+	if m.providerWizard.step == providerWizardStepModel {
+		switch {
+		case keyText(msg) != "":
+			m.providerWizard.appendModelSearch(keyRunes(msg))
+			return m, nil
+		case keyBackspace(msg):
+			m.providerWizard.deleteModelSearchRune()
+			return m, nil
+		case keyCtrl(msg, 'u'):
+			m.providerWizard.modelSearch = ""
+			m.providerWizard.selectedModel = 0
+			return m, nil
+		}
+	}
+	switch {
+	case keyIs(msg, tea.KeyEsc):
+		m.providerWizard = nil
+	case keyIs(msg, tea.KeyUp):
+		m.providerWizard.move(-1)
+	case keyIs(msg, tea.KeyDown) || keyIs(msg, tea.KeyTab):
+		m.providerWizard.move(1)
+	case keyIs(msg, tea.KeyLeft):
+		m.providerWizard.retreat()
+	case keyIs(msg, tea.KeyRight):
+		if m.providerWizard.canAdvanceWithRight() {
+			return m.advanceProviderWizard()
+		}
+	case keyIs(msg, tea.KeyEnter):
+		if m.providerWizard.step == providerWizardStepDone {
+			return m.applyProviderWizard()
+		}
+		return m.advanceProviderWizard()
+	}
+	return m, nil
+}
+
+func (m model) handleProviderWizardPaste(content string) (model, tea.Cmd) {
+	if m.providerWizard == nil || m.providerWizard.oauthPending {
+		return m, nil
+	}
+	switch m.providerWizard.step {
+	case providerWizardStepEndpoint:
+		m.providerWizard.appendBaseURL([]rune(content))
+	case providerWizardStepName:
+		m.providerWizard.appendProfileName([]rune(content))
+	case providerWizardStepCredential:
+		m.providerWizard.appendAPIKey([]rune(content))
+	case providerWizardStepModel:
+		m.providerWizard.appendModelSearch([]rune(content))
+	}
+	return m, nil
+}
+
+func (wizard *providerWizardState) canAdvanceWithRight() bool {
+	if wizard == nil {
+		return false
+	}
+	switch wizard.step {
+	case providerWizardStepMethod:
+		return len(providerWizardMethodOptions()) > 0
+	case providerWizardStepProvider:
+		return strings.TrimSpace(wizard.currentProvider().ID) != ""
+	case providerWizardStepEndpoint:
+		return providerWizardEndpointError(wizard.baseURL) == ""
+	case providerWizardStepName:
+		return true
+	case providerWizardStepCredential:
+		return wizard.credentialReadyForRight()
+	case providerWizardStepModel:
+		if providerWizardUsesTypedModel(wizard.currentProvider()) {
+			return strings.TrimSpace(wizard.modelSearch) != ""
+		}
+		if wizard.modelLoading {
+			return false
+		}
+		wizard.refreshModels()
+		return len(wizard.filteredModels()) > 0
+	default:
+		return false
+	}
+}
+
+func (wizard *providerWizardState) credentialReadyForRight() bool {
+	if strings.TrimSpace(wizard.apiKey) != "" {
+		return true
+	}
+	provider := wizard.currentProvider()
+	if !providerWizardNeedsCredential(provider) {
+		return true
+	}
+	for _, env := range provider.AuthEnvVars {
+		if strings.TrimSpace(os.Getenv(strings.TrimSpace(env))) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func (wizard *providerWizardState) appendAPIKey(runes []rune) {
+	for _, r := range runes {
+		if unicode.IsControl(r) || unicode.IsSpace(r) {
+			continue
+		}
+		wizard.apiKey += string(r)
+	}
+	wizard.err = ""
+}
+
+func (wizard *providerWizardState) deleteAPIKeyRune() {
+	if wizard.apiKey == "" {
+		return
+	}
+	runes := []rune(wizard.apiKey)
+	wizard.apiKey = string(runes[:len(runes)-1])
+	wizard.err = ""
+}
+
+func (wizard *providerWizardState) appendBaseURL(runes []rune) {
+	for _, r := range runes {
+		if unicode.IsControl(r) || unicode.IsSpace(r) {
+			continue
+		}
+		wizard.baseURL += string(r)
+	}
+	wizard.err = ""
+}
+
+func (wizard *providerWizardState) deleteBaseURLRune() {
+	if wizard.baseURL == "" {
+		return
+	}
+	runes := []rune(wizard.baseURL)
+	wizard.baseURL = string(runes[:len(runes)-1])
+	wizard.err = ""
+}
+
+func (wizard *providerWizardState) appendProfileName(runes []rune) {
+	for _, r := range runes {
+		if unicode.IsControl(r) || unicode.IsSpace(r) {
+			continue
+		}
+		wizard.profileName += string(r)
+	}
+	wizard.err = ""
+}
+
+func (wizard *providerWizardState) deleteProfileNameRune() {
+	if wizard.profileName == "" {
+		return
+	}
+	runes := []rune(wizard.profileName)
+	wizard.profileName = string(runes[:len(runes)-1])
+	wizard.err = ""
+}
+
+func (wizard *providerWizardState) appendModelSearch(runes []rune) {
+	for _, r := range runes {
+		if unicode.IsControl(r) {
+			continue
+		}
+		wizard.modelSearch += string(r)
+	}
+	wizard.selectedModel = 0
+}
+
+func (wizard *providerWizardState) deleteModelSearchRune() {
+	if wizard.modelSearch == "" {
+		return
+	}
+	runes := []rune(wizard.modelSearch)
+	wizard.modelSearch = string(runes[:len(runes)-1])
+	wizard.selectedModel = 0
+}
+
+func (m model) applyProviderWizard() (model, tea.Cmd) {
+	wizard := m.providerWizard
+	if wizard == nil {
+		return m, nil
+	}
+	provider := wizard.currentProvider()
+	modelChoice := wizard.currentModel()
+	profile := providerWizardProfile(provider, modelChoice.ID, wizard.apiKey, wizard.baseURL, wizard.profileName)
+	runtimeProfile := providerWizardRuntimeProfile(profile)
+
+	// Build and persist into LOCALS first, committing live state only once BOTH
+	// succeed. A persist failure (read-only config, disk full) must not leave the
+	// chat running on the new provider while the status line, m.providerProfile,
+	// and the SONUT_PROVIDER export (which pins spawned children) still point at
+	// the old one — parent and children would silently run on different providers.
+	var nextProvider sonutruntime.Provider
+	if m.newProvider != nil {
+		built, err := m.newProvider(runtimeProfile)
+		if err != nil {
+			wizard.err = redaction.RedactString(err.Error(), redaction.Options{ExtraSecretValues: []string{profile.APIKey, runtimeProfile.APIKey}})
+			return m, nil
+		}
+		nextProvider = built
+	}
+	if strings.TrimSpace(m.userConfigPath) != "" {
+		// Capture flip: move the freshly entered key into the encrypted credential
+		// store before persisting, so config.json never holds the cleartext. The
+		// provider was already built above from runtimeProfile, which has the key.
+		secret := profile.APIKey
+		profile = config.SecureProviderProfile(profile, m.userConfigPath)
+		if _, err := config.UpsertProvider(m.userConfigPath, profile, true); err != nil {
+			wizard.err = redaction.RedactString(err.Error(), redaction.Options{ExtraSecretValues: []string{secret, profile.APIKey}})
+			return m, nil // nothing committed to live state yet
+		}
+	}
+
+	// Both succeeded — commit the live provider, profile, model, and the child
+	// env export together, so they can never disagree.
+	if nextProvider != nil {
+		m.provider = nextProvider
+	}
+	m.providerProfile = profile
+	m.providerName = profile.Name
+	m.modelName = profile.Model
+	// Keep sub-agent child processes on the same provider we just switched to —
+	// same as the /model and /provider switch paths (command_center.go). Without
+	// this, a SONUT_PROVIDER exported by an earlier switch stays pointing at the
+	// OLD provider and wins over config in every spawned child (applyEnv), so
+	// specialists/swarm members run on the wrong provider's credentials.
+	config.SetActiveProviderEnv(profile.Name)
+	m.providerWizard = nil
+	return m, nil
+}
+
+// wizardProviderStoredKey reports the saved provider name that has a key in the
+// credential store matching the wizard-selected descriptor, so the wizard can offer
+// keep/replace/remove instead of forcing a new key entry.
+func (m model) wizardProviderStoredKey(provider providercatalog.Descriptor) (string, bool) {
+	for _, profile := range m.savedProviders {
+		if !profile.APIKeyStored {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(profile.Name), strings.TrimSpace(provider.Name)) ||
+			strings.EqualFold(strings.TrimSpace(profile.CatalogID), strings.TrimSpace(provider.ID)) ||
+			strings.EqualFold(strings.TrimSpace(profile.Name), strings.TrimSpace(provider.ID)) {
+			return profile.Name, true
+		}
+	}
+	return "", false
+}
+
+// applyManageKeyChoice acts on the keep/replace/remove selection. Keep closes the
+// wizard (nothing changes); Replace routes to credential entry (overwrites on save);
+// Remove deletes the stored key and its marker.
+func (m model) applyManageKeyChoice() (model, tea.Cmd) {
+	wizard := m.providerWizard
+	if wizard == nil {
+		return m, nil
+	}
+	name := strings.TrimSpace(wizard.manageProviderName)
+	switch wizard.manageKeyCursor {
+	case 1: // Replace
+		wizard.apiKey = ""
+		wizard.err = ""
+		wizard.step = providerWizardStepCredential
+		return m, nil
+	case 2: // Remove
+		if strings.TrimSpace(m.userConfigPath) != "" {
+			if store, err := config.ProviderKeyStoreAt(filepath.Dir(m.userConfigPath)); err == nil {
+				_, _ = store.Delete(name)
+			}
+			_, _ = config.ClearProviderKeyStored(m.userConfigPath, name)
+		} else {
+			_, _ = config.ForgetProviderKey(name)
+		}
+		m.providerWizard = nil
+		m.transcript = reduceTranscript(m.transcript, transcriptAction{kind: actionAppendSystem, text: "Provider\nRemoved the stored key for " + name + ". Re-add it any time with /provider."})
+		return m, nil
+	default: // Keep
+		m.providerWizard = nil
+		m.transcript = reduceTranscript(m.transcript, transcriptAction{kind: actionAppendSystem, text: "Provider\nKept the saved key for " + name + "."})
+		return m, nil
+	}
+}
+
+func providerWizardRuntimeProfile(profile config.ProviderProfile) config.ProviderProfile {
+	runtimeProfile := profile
+	if strings.TrimSpace(runtimeProfile.APIKey) == "" && strings.TrimSpace(runtimeProfile.APIKeyEnv) != "" {
+		runtimeProfile.APIKey = strings.TrimSpace(os.Getenv(runtimeProfile.APIKeyEnv))
+	}
+	return runtimeProfile
+}
+
+func (m model) providerWizardOverlay(width int) string {
+	if m.providerWizard == nil {
+		return ""
+	}
+	return m.providerWizard.render(width)
+}
+
+func (wizard *providerWizardState) render(width int) string {
+	if wizard == nil {
+		return ""
+	}
+	overlayWidth := providerWizardOverlayWidth(width, wizard.step)
+	innerWidth := maxInt(20, overlayWidth-4)
+
+	lines := []string{
+		sonutTheme.faint.Render(providerWizardStepLine(wizard)),
+		sonutTheme.line.Render(strings.Repeat("─", innerWidth)),
+	}
+	if wizard.err != "" {
+		lines = append(lines, sonutTheme.red.Render("error: "+wizard.err), "")
+	}
+	if wizard.oauthPending {
+		lines = append(lines, wizard.renderOAuthWaiting(innerWidth)...)
+		lines = append(lines,
+			sonutTheme.line.Render(strings.Repeat("─", innerWidth)),
+			sonutTheme.faint.Render("Esc cancel"),
+		)
+		block := styledBlockFillTitle(overlayWidth, "Provider setup", lines, sonutTheme.lineStrong, lipgloss.NewStyle())
+		if width > overlayWidth {
+			return indentBlock(block, (width-overlayWidth)/2)
+		}
+		return block
+	}
+	switch wizard.step {
+	case providerWizardStepMethod:
+		lines = append(lines, wizard.renderMethodStep(innerWidth)...)
+	case providerWizardStepProvider:
+		lines = append(lines, wizard.renderProviderStep(innerWidth)...)
+	case providerWizardStepManageKey:
+		lines = append(lines, wizard.renderManageKeyStep(innerWidth)...)
+	case providerWizardStepEndpoint:
+		lines = append(lines, wizard.renderEndpointStep(innerWidth)...)
+	case providerWizardStepName:
+		lines = append(lines, wizard.renderNameStep(innerWidth)...)
+	case providerWizardStepCredential:
+		lines = append(lines, wizard.renderCredentialStep(innerWidth)...)
+	case providerWizardStepModel:
+		lines = append(lines, wizard.renderModelStep(innerWidth)...)
+	case providerWizardStepDone:
+		lines = append(lines, wizard.renderDoneStep(innerWidth)...)
+	}
+	lines = append(lines,
+		sonutTheme.line.Render(strings.Repeat("─", innerWidth)),
+		sonutTheme.faint.Render(wizard.footer()),
+	)
+
+	block := styledBlockFillTitle(overlayWidth, "Provider setup", lines, sonutTheme.lineStrong, lipgloss.NewStyle())
+	if width > overlayWidth {
+		return indentBlock(block, (width-overlayWidth)/2)
+	}
+	return block
+}
+
+func (wizard *providerWizardState) footer() string {
+	canRight := wizard.canAdvanceWithRight()
+	switch wizard.step {
+	case providerWizardStepMethod:
+		return "↑/↓ move   Enter/→ continue   Esc close"
+	case providerWizardStepProvider:
+		if wizard.oauthMode && wizard.currentProvider().OAuthDeviceFlow {
+			return "↑/↓ move   Enter sign in   d device code   ← back   Esc close"
+		}
+		if canRight {
+			return "↑/↓ move   Enter/→ continue   ← back   Esc close"
+		}
+		return "↑/↓ move   Enter continue   ← back   Esc close"
+	case providerWizardStepManageKey:
+		return "↑/↓ move   Enter select   Esc back"
+	case providerWizardStepEndpoint:
+		if canRight {
+			return "Enter/→ continue   ← back   Esc close"
+		}
+		return "Enter continue   ← back   Esc close"
+	case providerWizardStepName:
+		return "Enter/→ continue   ← back   Esc close"
+	case providerWizardStepModel:
+		if canRight {
+			return "↑/↓ move   Enter/→ continue   ← back   Esc close"
+		}
+		return "↑/↓ move   Enter continue   ← back   Esc close"
+	case providerWizardStepDone:
+		return "Enter save   ← back   Esc close"
+	default:
+		if canRight {
+			return "Enter/→ continue   ← back   Esc close"
+		}
+		return "Enter continue   ← back   Esc close"
+	}
+}
+
+func providerWizardOverlayWidth(width int, step providerWizardStep) int {
+	if width <= 0 {
+		return providerWizardProviderWidth
+	}
+	target := providerWizardMediumWidth
+	switch step {
+	case providerWizardStepProvider:
+		target = providerWizardProviderWidth
+	case providerWizardStepModel:
+		target = providerWizardModelWidth
+	}
+	target = minInt(target, width)
+	if target < providerWizardMinWidth {
+		return width
+	}
+	return target
+}
+
+func providerWizardStepLine(wizard *providerWizardState) string {
+	if wizard == nil {
+		return ""
+	}
+	step := wizard.step
+	type stepLabel struct {
+		step  providerWizardStep
+		label string
+	}
+	steps := []stepLabel{
+		{providerWizardStepMethod, "1 method"},
+		{providerWizardStepProvider, "2 provider"},
+	}
+	switch {
+	case wizard.oauthMode:
+		// OAuth path skips endpoint/name/key entirely.
+		steps = append(steps,
+			stepLabel{providerWizardStepModel, "3 model"},
+			stepLabel{providerWizardStepDone, "4 ready"},
+		)
+	case providerWizardNeedsEndpoint(wizard.currentProvider()):
+		steps = append(steps,
+			stepLabel{providerWizardStepEndpoint, "3 endpoint"},
+			stepLabel{providerWizardStepName, "4 name"},
+			stepLabel{providerWizardStepCredential, "5 key"},
+			stepLabel{providerWizardStepModel, "6 model"},
+			stepLabel{providerWizardStepDone, "7 ready"},
+		)
+	default:
+		steps = append(steps,
+			stepLabel{providerWizardStepCredential, "3 key"},
+			stepLabel{providerWizardStepModel, "4 model"},
+			stepLabel{providerWizardStepDone, "5 ready"},
+		)
+	}
+	parts := make([]string, 0, len(steps))
+	for _, item := range steps {
+		if item.step == step {
+			parts = append(parts, "["+item.label+"]")
+		} else {
+			parts = append(parts, item.label)
+		}
+	}
+	return strings.Join(parts, "  ")
+}
+
+// renderMethodStep renders the "How do you want to connect?" chooser.
+func (wizard *providerWizardState) renderMethodStep(width int) []string {
+	options := providerWizardMethodOptions()
+	wizard.selectedMethod = clampInt(wizard.selectedMethod, 0, maxInt(0, len(options)-1))
+	lines := []string{sonutTheme.accent.Render("How do you want to connect?")}
+	for index, option := range options {
+		surface := transparentSurface
+		marker := surface(sonutTheme.faintest).Render("  ")
+		if index == wizard.selectedMethod {
+			surface = sonutTheme.onSel
+			marker = surface(sonutTheme.accent).Render("❯ ")
+		}
+		lines = append(lines, fitStyledLine(marker+surface(sonutTheme.ink).Render(option.label), width))
+		lines = append(lines, fitStyledLine("    "+sonutTheme.faint.Render(option.subtitle), width))
+	}
+	return lines
+}
+
+// renderManageKeyStep shows keep/replace/remove for a provider that already has a
+// key in the encrypted credential store.
+func (wizard *providerWizardState) renderManageKeyStep(width int) []string {
+	name := strings.TrimSpace(wizard.manageProviderName)
+	if name == "" {
+		name = wizard.currentProvider().Name
+	}
+	options := []struct{ label, subtitle string }{
+		{"Keep current key", "A key is already saved (encrypted) for " + name + "."},
+		{"Replace key", "Enter a new key; it overwrites the stored one."},
+		{"Remove key", "Delete the stored key for " + name + "."},
+	}
+	wizard.manageKeyCursor = clampInt(wizard.manageKeyCursor, 0, len(options)-1)
+	lines := []string{sonutTheme.accent.Render(name + " already has a saved key")}
+	for index, option := range options {
+		surface := transparentSurface
+		marker := surface(sonutTheme.faintest).Render("  ")
+		if index == wizard.manageKeyCursor {
+			surface = sonutTheme.onSel
+			marker = surface(sonutTheme.accent).Render("❯ ")
+		}
+		lines = append(lines, fitStyledLine(marker+surface(sonutTheme.ink).Render(option.label), width))
+		lines = append(lines, fitStyledLine("    "+sonutTheme.faint.Render(option.subtitle), width))
+	}
+	return lines
+}
+
+// renderOAuthWaiting renders the in-flight browser/device login screen.
+func (wizard *providerWizardState) renderOAuthWaiting(width int) []string {
+	provider := wizard.currentProvider()
+	name := provider.Name
+	if name == "" {
+		name = "the provider"
+	}
+	if wizard.oauthDevice {
+		lines := []string{
+			sonutTheme.accent.Render("Device-code sign-in for " + name),
+			"",
+		}
+		if wizard.deviceUserCode == "" {
+			return append(lines, fitStyledLine(sonutTheme.faint.Render("Requesting a device code..."), width))
+		}
+		return append(lines,
+			fitStyledLine(sonutTheme.ink.Render("1. On any device, visit:  ")+sonutTheme.accent.Render(wizard.deviceVerificationURI), width),
+			fitStyledLine(sonutTheme.ink.Render("2. Enter the code:  ")+sonutTheme.accent.Bold(true).Render(wizard.deviceUserCode), width),
+			"",
+			fitStyledLine(sonutTheme.faint.Render("Waiting for authorization..."), width),
+		)
+	}
+	return []string{
+		sonutTheme.accent.Render("Signing in with " + name),
+		"",
+		fitStyledLine(sonutTheme.ink.Render("Opening your browser — approve there, then return here."), width),
+		fitStyledLine(sonutTheme.faint.Render("Waiting for authorization..."), width),
+		"",
+		fitStyledLine(sonutTheme.faint.Render("If your browser didn't open, run:  "+providerWizardOAuthCLIHint(provider)), width),
+	}
+}
+
+// providerWizardOAuthCLIHint gives the equivalent CLI command for a provider's
+// OAuth login (fallback when the browser doesn't open).
+func providerWizardOAuthCLIHint(provider providercatalog.Descriptor) string {
+	if provider.OAuthMintsKey {
+		return "at auth openrouter"
+	}
+	return "at auth login " + provider.ID
+}
+
+func (wizard *providerWizardState) renderProviderStep(width int) []string {
+	header := "Choose provider"
+	if wizard.oauthMode {
+		header = "Choose an OAuth provider"
+	}
+	lines := []string{sonutTheme.accent.Render(header)}
+	maxVisible := minInt(maxProviderWizardProvidersVisible, len(wizard.providers))
+	start := selectableListStart(len(wizard.providers), maxVisible, wizard.selectedProvider)
+	for offset, provider := range wizard.providers[start : start+maxVisible] {
+		lines = append(lines, wizard.renderSelectableProvider(width, start+offset, provider))
+	}
+	// A failed OAuth attempt leaves the wizard on this list (it does not advance),
+	// so the error must render here or the click looks like a silent no-op. The
+	// credential step renders its own copy for the ctrl+o path.
+	if wizard.oauthMode && wizard.oauthErr != "" {
+		lines = append(lines, "", sonutTheme.red.Render("OAuth login failed: "+wizard.oauthErr))
+		if hint := providerWizardOAuthErrHint(wizard.currentProvider()); hint != "" {
+			lines = append(lines, sonutTheme.faint.Render(hint))
+		}
+	}
+	return lines
+}
+
+// providerWizardOAuthErrHint returns a provider-specific next step for a failed
+// OAuth login. Hugging Face ships no public client_id (unlike xAI), so a login
+// can only work once the operator registers an app and supplies its client_id.
+func providerWizardOAuthErrHint(provider providercatalog.Descriptor) string {
+	if strings.EqualFold(provider.ID, "huggingface") {
+		return "Hugging Face needs your own app: create one at " +
+			"https://huggingface.co/settings/applications/new, then set SONUT_OAUTH_HUGGINGFACE_CLIENT_ID."
+	}
+	return ""
+}
+
+func (wizard *providerWizardState) renderSelectableProvider(width int, index int, provider providercatalog.Descriptor) string {
+	selected := index == wizard.selectedProvider
+	surface := transparentSurface
+	marker := surface(sonutTheme.faintest).Render("  ")
+	if selected {
+		surface = sonutTheme.onSel
+		marker = surface(sonutTheme.accent).Render("❯ ")
+	}
+	name := provider.Name
+	if provider.Recommended {
+		name = "★ " + name
+	}
+	left := marker + surface(sonutTheme.ink).Render(name)
+	if badge := providerWizardBadge(provider); badge != "" {
+		left += surface(sonutTheme.faint).Render("   " + badge)
+	}
+	return fitStyledLine(left, width)
+}
+
+// providerWizardBadge is the faint hint shown next to a provider row. The
+// recommended provider takes precedence over the OAuth hint.
+func providerWizardBadge(provider providercatalog.Descriptor) string {
+	if provider.Recommended {
+		return "(recommended)"
+	}
+	return providerWizardOAuthBadge(provider)
+}
+
+// providerWizardOAuthBadge is the faint mode hint shown next to OAuth providers.
+func providerWizardOAuthBadge(provider providercatalog.Descriptor) string {
+	if !provider.OAuth {
+		return ""
+	}
+	if provider.OAuthMintsKey {
+		return "browser sign-in · creates a key"
+	}
+	if provider.OAuthDeviceFlow {
+		return "browser or device code"
+	}
+	return "browser sign-in"
+}
+
+func (wizard *providerWizardState) renderEndpointStep(width int) []string {
+	provider := wizard.currentProvider()
+	input := providerWizardInputLine("url > ", wizard.baseURL, providerWizardEndpointPlaceholder(provider), width)
+	return []string{
+		sonutTheme.accent.Render("Endpoint URL"),
+		sonutTheme.ink.Render("Enter the API base URL for " + provider.Name + "."),
+		sonutTheme.faint.Render(providerWizardEndpointHint(provider)),
+		input,
+	}
+}
+
+func providerWizardEndpointPlaceholder(provider providercatalog.Descriptor) string {
+	if provider.Transport == providercatalog.TransportAnthropicCompatible {
+		return "https://api.example.com/anthropic"
+	}
+	return "https://api.example.com/v1"
+}
+
+func providerWizardEndpointHint(provider providercatalog.Descriptor) string {
+	if provider.Transport == providercatalog.TransportAnthropicCompatible {
+		return "Use the base URL before /v1/messages."
+	}
+	return "Use the base URL before /chat/completions."
+}
+
+func (wizard *providerWizardState) renderNameStep(width int) []string {
+	name := providerWizardDisplayName(wizard.currentProvider(), wizard.baseURL, wizard.profileName)
+	return []string{
+		sonutTheme.accent.Render("Provider name"),
+		sonutTheme.ink.Render("Choose the short label shown in the status bar."),
+		sonutTheme.faint.Render("Leave blank to use " + name + "."),
+		providerWizardInputLine("name > ", strings.TrimSpace(wizard.profileName), name, width),
+	}
+}
+
+func (wizard *providerWizardState) renderCredentialStep(width int) []string {
+	provider := wizard.currentProvider()
+	oauth := providerWizardSupportsOAuth(provider)
+
+	env := firstProviderDisplayValue(provider.AuthEnvVars...)
+	value := sonutTheme.accent.Render("▌") + sonutTheme.faint.Render("paste key here")
+	if wizard.apiKey != "" {
+		value = sonutTheme.ink.Render(maskedProviderWizardKey(wizard.apiKey)) + sonutTheme.accent.Render("▌")
+	}
+	input := sonutTheme.userPrompt.Render("api key > ") + value
+	lines := []string{
+		sonutTheme.accent.Render("Paste API key"),
+		sonutTheme.ink.Render(providerWizardCredentialInstruction(env)),
+		input,
+		sonutTheme.faint.Render("Pasted keys are hidden and saved in your user config."),
+	}
+	if oauth {
+		lines = append(lines, sonutTheme.accent.Render("or  ctrl+o  to log in with OAuth in the browser (no key needed)"))
+	}
+	if wizard.oauthErr != "" {
+		lines = append(lines, sonutTheme.red.Render("OAuth login failed: "+wizard.oauthErr))
+	}
+	return lines
+}
+
+func providerWizardCredentialInstruction(env string) string {
+	if env = strings.TrimSpace(env); env != "" {
+		return "Paste a key, or leave blank to use " + env + "."
+	}
+	return "Paste a key, or leave blank to use your shell env."
+}
+
+func (wizard *providerWizardState) renderModelStep(width int) []string {
+	if providerWizardUsesTypedModel(wizard.currentProvider()) {
+		return wizard.renderTypedModelStep(width)
+	}
+	if wizard.modelLoading {
+		return wizard.renderModelLoadingStep(width)
+	}
+	lines := []string{sonutTheme.accent.Render("Choose a model")}
+	if status := wizard.modelStatusText(); status != "" {
+		lines = append(lines, sonutTheme.faint.Render(status))
+	}
+	lines = append(lines, wizard.renderModelSearch(width))
+	wizard.refreshModels()
+	models := wizard.filteredModels()
+	if len(models) == 0 {
+		lines = append(lines, sonutTheme.faint.Render("  no matching models"))
+		return lines
+	}
+	maxVisible := minInt(maxProviderWizardModelsVisible, len(models))
+	wizard.selectedModel = clampInt(wizard.selectedModel, 0, len(models)-1)
+	start := selectableListStart(len(models), maxVisible, wizard.selectedModel)
+	for offset, model := range models[start : start+maxVisible] {
+		lines = append(lines, wizard.renderSelectableModel(width, start+offset, model))
+	}
+	if detail := providerWizardModelDetail(wizard.currentModel()); detail != "" {
+		lines = append(lines, fitStyledLine(sonutTheme.faint.Render("  "+detail), width))
+	}
+	return lines
+}
+
+func (wizard *providerWizardState) renderModelLoadingStep(width int) []string {
+	return []string{
+		sonutTheme.accent.Render("Choose a model"),
+		"",
+		fitStyledLine(sonutTheme.faint.Render("Checking available models..."), width),
+		fitStyledLine(sonutTheme.faint.Render("Built-in models will be used if discovery fails."), width),
+	}
+}
+
+func (wizard *providerWizardState) renderModelSearch(width int) string {
+	query := strings.TrimSpace(wizard.modelSearch)
+	return providerWizardInputLine("search > ", query, "model name...", width)
+}
+
+func providerWizardInputLine(promptText string, value string, placeholder string, width int) string {
+	prompt := sonutTheme.userPrompt.Render("search > ")
+	cursor := sonutTheme.accent.Render("▌")
+	if promptText != "" {
+		prompt = sonutTheme.userPrompt.Render(promptText)
+	}
+	if value == "" {
+		return fitStyledLine(prompt+cursor+sonutTheme.faint.Render(placeholder), width)
+	}
+	return fitStyledLine(prompt+sonutTheme.ink.Render(value)+cursor, width)
+}
+
+func (wizard *providerWizardState) renderTypedModelStep(width int) []string {
+	provider := wizard.currentProvider()
+	return []string{
+		sonutTheme.accent.Render("Model name"),
+		sonutTheme.ink.Render("Enter the model ID this endpoint expects."),
+		sonutTheme.faint.Render("Examples: gpt-4.1, claude-sonnet-4-5, llama-3.3-70b"),
+		providerWizardInputLine("model > ", strings.TrimSpace(wizard.modelSearch), provider.DefaultModel, width),
+	}
+}
+
+func (wizard *providerWizardState) modelStatusText() string {
+	if wizard.modelLoadError != "" {
+		return "Using built-in model list"
+	}
+	return ""
+}
+
+func (wizard *providerWizardState) renderSelectableModel(width int, index int, model providerWizardModel) string {
+	selected := index == wizard.selectedModel
+	surface := transparentSurface
+	marker := surface(sonutTheme.faintest).Render("  ")
+	if selected {
+		surface = sonutTheme.onSel
+		marker = surface(sonutTheme.accent).Render("❯ ")
+	}
+	left := marker + surface(sonutTheme.ink).Render(model.displayLabel())
+	return fitStyledLine(left, width)
+}
+
+func providerWizardModelDetail(model providerWizardModel) string {
+	parts := []string{}
+	if secondary := strings.TrimSpace(model.secondaryText()); secondary != "" && !providerWizardGenericModelDescription(secondary) {
+		parts = append(parts, secondary)
+	}
+	if meta := strings.TrimSpace(model.Meta); meta != "" {
+		parts = append(parts, meta)
+	}
+	return strings.Join(parts, " · ")
+}
+
+func (wizard *providerWizardState) filteredModels() []providerWizardModel {
+	if wizard == nil {
+		return nil
+	}
+	query := strings.ToLower(strings.TrimSpace(wizard.modelSearch))
+	if query == "" {
+		return append([]providerWizardModel{}, wizard.models...)
+	}
+	models := make([]providerWizardModel, 0, len(wizard.models))
+	for _, model := range wizard.models {
+		if model.matches(query) {
+			models = append(models, model)
+		}
+	}
+	return models
+}
+
+func (model providerWizardModel) displayLabel() string {
+	description := strings.TrimSpace(model.Description)
+	if description != "" && !providerWizardGenericModelDescription(description) {
+		return description
+	}
+	return model.ID
+}
+
+func (model providerWizardModel) secondaryText() string {
+	if model.displayLabel() != model.ID {
+		return model.ID
+	}
+	return model.Description
+}
+
+func (model providerWizardModel) matches(query string) bool {
+	if query == "" {
+		return true
+	}
+	haystack := strings.ToLower(strings.Join([]string{model.ID, model.Description, model.Meta}, " "))
+	return strings.Contains(haystack, query)
+}
+
+func providerWizardGenericModelDescription(description string) bool {
+	switch strings.ToLower(strings.TrimSpace(description)) {
+	case "", "catalog default", "catalog model", "custom endpoint model", "live model":
+		return true
+	default:
+		return strings.HasSuffix(strings.ToLower(strings.TrimSpace(description)), " model")
+	}
+}
+
+func (wizard *providerWizardState) renderDoneStep(width int) []string {
+	provider := wizard.currentProvider()
+	model := wizard.currentModel()
+	lines := []string{
+		sonutTheme.accent.Render("Ready to connect"),
+		"",
+		sonutTheme.ink.Render("Provider    " + provider.Name),
+	}
+	if providerWizardNeedsEndpoint(provider) {
+		lines = append(lines, sonutTheme.ink.Render("Endpoint    "+strings.TrimSpace(wizard.baseURL)))
+	}
+	lines = append(lines,
+		sonutTheme.ink.Render("Name        "+providerWizardDisplayName(provider, wizard.baseURL, wizard.profileName)),
+		sonutTheme.ink.Render("Model       "+model.ID),
+		sonutTheme.ink.Render("Credential  "+providerWizardCredentialLabel(provider, wizard.apiKey)),
+		"",
+		sonutTheme.faint.Render("Press Enter to save and start using this provider."),
+	)
+	return lines
+}
+
+func providerWizardCredentialLabel(provider providercatalog.Descriptor, apiKey string) string {
+	if strings.TrimSpace(apiKey) != "" {
+		return "pasted key"
+	}
+	if env := firstProviderDisplayValue(provider.AuthEnvVars...); provider.RequiresAuth && env != "" {
+		return env + " env var"
+	}
+	return "not required"
+}
+
+func maskedProviderWizardKey(value string) string {
+	count := len([]rune(value))
+	if count == 0 {
+		return ""
+	}
+	if count > 24 {
+		count = 24
+	}
+	return strings.Repeat("*", count)
+}
+
+func providerWizardProfile(provider providercatalog.Descriptor, model string, apiKey string, baseURL string, profileName string) config.ProviderProfile {
+	profile := config.ProviderProfile{
+		Name:         providerWizardDisplayName(provider, baseURL, profileName),
+		ProviderKind: providerWizardProviderKind(provider),
+		CatalogID:    provider.ID,
+		BaseURL:      firstProviderDisplayValue(strings.TrimSpace(baseURL), provider.DefaultBaseURL),
+		APIFormat:    providerWizardAPIFormat(provider),
+		Model:        firstProviderDisplayValue(model, provider.DefaultModel),
+	}
+	if apiKey = strings.TrimSpace(apiKey); apiKey != "" {
+		profile.APIKey = apiKey
+	} else if env := firstProviderDisplayValue(provider.AuthEnvVars...); provider.RequiresAuth && env != "" {
+		profile.APIKeyEnv = env
+	}
+	return profile
+}
+
+func providerWizardEndpointError(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "enter an endpoint URL before continuing"
+	}
+	parsed, err := url.ParseRequestURI(value)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "enter a valid endpoint URL including https://"
+	}
+	if parsed.Scheme != "https" && parsed.Scheme != "http" {
+		return "endpoint URL must start with http:// or https://"
+	}
+	if parsed.Scheme == "http" && !providerWizardIsLoopbackHost(parsed.Hostname()) {
+		return "endpoint URL must use https:// unless it is local loopback"
+	}
+	return ""
+}
+
+func providerWizardIsLoopbackHost(host string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func providerWizardDisplayName(provider providercatalog.Descriptor, baseURL string, profileName string) string {
+	if name := strings.TrimSpace(profileName); name != "" {
+		return name
+	}
+	if providerWizardNeedsProfileName(provider) {
+		return providerWizardNameFromBaseURL(baseURL)
+	}
+	return provider.ID
+}
+
+func providerWizardNameFromBaseURL(baseURL string) string {
+	parsed, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil || parsed.Host == "" {
+		return "custom"
+	}
+	host := strings.ToLower(parsed.Hostname())
+	if ip := net.ParseIP(host); ip != nil {
+		return providerWizardSanitizedName("ip-" + ip.String())
+	}
+	host = strings.TrimPrefix(host, "api.")
+	host = strings.TrimPrefix(host, "gateway.")
+	parts := strings.Split(host, ".")
+	if len(parts) >= 2 {
+		return parts[len(parts)-2]
+	}
+	if host != "" {
+		return strings.ReplaceAll(host, ":", "-")
+	}
+	return "custom"
+}
+
+func providerWizardSanitizedName(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	var builder strings.Builder
+	lastDash := false
+	for _, r := range value {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			builder.WriteRune(r)
+			lastDash = false
+			continue
+		}
+		if !lastDash && builder.Len() > 0 {
+			builder.WriteRune('-')
+			lastDash = true
+		}
+	}
+	return strings.Trim(builder.String(), "-")
+}
+
+func providerWizardProviderKind(provider providercatalog.Descriptor) config.ProviderKind {
+	switch provider.Transport {
+	case providercatalog.TransportOpenAI:
+		return config.ProviderKindOpenAI
+	case providercatalog.TransportAnthropic:
+		return config.ProviderKindAnthropic
+	case providercatalog.TransportAnthropicCompatible:
+		return config.ProviderKindAnthropicCompat
+	case providercatalog.TransportGoogle:
+		return config.ProviderKindGoogle
+	case providercatalog.TransportOpenAICompatible:
+		return config.ProviderKindOpenAICompatible
+	default:
+		return config.ProviderKind(strings.ToLower(string(provider.Transport)))
+	}
+}
+
+func providerWizardAPIFormat(provider providercatalog.Descriptor) string {
+	if provider.Transport == providercatalog.TransportOpenAI || provider.Transport == providercatalog.TransportOpenAICompatible {
+		return string(providercatalog.APIFormatOpenAIChatCompletions)
+	}
+	if len(provider.SupportedAPIFormats) == 0 {
+		return ""
+	}
+	return string(provider.SupportedAPIFormats[0])
+}
